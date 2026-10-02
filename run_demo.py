@@ -146,6 +146,68 @@ def main() -> None:
     expect("重启后正常用户可登录", restarted.login, "赵远征", "Quiet-Fox-904!")
     print(f"重启后重用记录仍可查询: {len(restarted.list_reuse_events())} 条")
 
+    section("8. 按登录设备管理会话（虚构设备）")
+    dev = AuthService(str(DATA_DIR / "devices.json"),
+                      access_ttl=timedelta(seconds=30),
+                      refresh_ttl=timedelta(seconds=300))
+    dev.create_user("陈默", "Silent-River-308!")
+    phone = dev.login("陈默", "Silent-River-308!",
+                      device_id="phone-01", device_name="旧手机")
+    laptop = dev.login("陈默", "Silent-River-308!",
+                       device_id="laptop-02", device_name="工作电脑")
+    print("陈默已在 旧手机 / 工作电脑 两台虚构设备上登录")
+
+    rotated = dev.refresh(phone.refresh_token)
+    print("旧手机完成续期，仍归属 device_id=phone-01（身份沿用）")
+    expect("旧手机上的旧续期凭据被重放（疑似泄露）", dev.refresh,
+           phone.refresh_token, expected=TokenReuseDetectedError)
+    frozen = dev.list_reuse_events(phone.family)[0]
+    print(f"被冻结的链: family={frozen['family'][:12]}… "
+          f"device={frozen['device_id']}（只冻结这一条链）")
+    expect("工作电脑完全不受影响", dev.check_access, laptop.access_token)
+    dev.refresh(laptop.refresh_token)
+    print("工作电脑续期成功，确认单设备冻结不波及其他设备")
+
+    relogin = dev.login("陈默", "Silent-River-308!",
+                        device_id="phone-01", device_name="旧手机")
+    expect("旧手机重新登录后的新链正常续期", dev.refresh,
+           relogin.refresh_token)
+    print("重新登录产生全新 family，未被旧链的熔断牵连")
+
+    dev.rename_device("陈默", "phone-01", "新手机")
+    entry = next(d for d in dev.list_devices("陈默")
+                 if d["device_id"] == "phone-01")
+    print(f"设备重命名后列表显示: {entry['device_name']}")
+    history = dev.list_activity(username="陈默", device_id="phone-01")
+    print(f"重命名前的审计记录仍归属旧名称 "
+          f"'{history[0]['device_name']}'（审计归属不变）")
+
+    dev.logout_device("陈默", "laptop-02")
+    expect("工作电脑被单独退出", dev.check_access, laptop.access_token,
+           expected=TokenRevokedError)
+    expect("旧手机新链仍然有效", dev.check_access, relogin.access_token)
+
+    activity = dev.list_activity(username="陈默")
+    print(f"设备活动记录 {len(activity)} 条（可导出，不含原始凭据）:")
+    for event in activity:
+        print(f"  - {event['kind']:7s} | {event['device_id']:9s} | "
+              f"{event['device_name']} | {event['detail']}")
+    assert phone.refresh_token not in repr(activity)
+
+    dev.disable_user("陈默")
+    print("账户停用：全部设备会话同时结束")
+    expect("停用后任何设备访问", dev.check_access, relogin.access_token,
+           expected=AccountDisabledError)
+    dev.enable_user("陈默")
+    expect("重开账户后旧会话仍已撤销", dev.check_access,
+           relogin.access_token, expected=TokenRevokedError)
+    dev.login("陈默", "Silent-River-308!", device_id="tablet-03",
+              device_name="平板")
+    remaining = dev.list_devices("陈默")
+    print("重开后设备列表: "
+          + ", ".join(f"{d['device_name']}({len(d['sessions'])}个会话)"
+                      for d in remaining))
+
     print("\n全部场景走完：过期 / 撤销 / 停用 / 格式错误均为独立错误类型，"
           "没有伪装成网络失败。")
 

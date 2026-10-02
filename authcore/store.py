@@ -30,13 +30,19 @@ class Store:
                     "access": {},
                     "refresh": {},
                     "reuse": [],
+                    "activity": [],
+                    "devices": {},
                     "seq": 0,
                 }
             )
 
     def _read(self) -> dict:
         with open(self.path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Migrate databases written by older versions.
+        data.setdefault("activity", [])
+        data.setdefault("devices", {})
+        return data
 
     def _write(self, data: dict) -> None:
         tmp = self.path + ".tmp"

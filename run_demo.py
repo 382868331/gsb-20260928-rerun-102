@@ -146,6 +146,89 @@ def main() -> None:
     expect("重启后正常用户可登录", restarted.login, "赵远征", "Quiet-Fox-904!")
     print(f"重启后重用记录仍可查询: {len(restarted.list_reuse_events())} 条")
 
+    section("8. 按登录设备管理会话")
+    phone = svc.login("赵远征", "Quiet-Fox-904!",
+                      device_id="phone-01", device_name="口袋手机")
+    laptop = svc.login("赵远征", "Quiet-Fox-904!",
+                       device_id="laptop-01", device_name="书房电脑")
+    print("同一账户在两台虚构设备上登录: phone-01 / laptop-01")
+
+    section("8a. 多台设备并发续期：各自独立的链，全部成功")
+    barrier2 = threading.Barrier(2)
+    results2: list[object] = []
+
+    def rotate2(bundle):
+        barrier2.wait()
+        try:
+            results2.append(svc.refresh(bundle.refresh_token))
+        except AuthError as exc:
+            results2.append(exc)
+
+    ts = [threading.Thread(target=rotate2, args=(b,)) for b in (phone, laptop)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    print("两台设备的续期都成功（链互相独立）:",
+          all(not isinstance(r, AuthError) for r in results2))
+    by_device = {r.device_id: r for r in results2
+                 if not isinstance(r, AuthError)}
+    phone2, laptop2 = by_device["phone-01"], by_device["laptop-01"]
+
+    section("8b. 怀疑手机泄露续期凭据：只冻结手机这条链")
+    frozen = svc.logout_device("赵远征", "phone-01")
+    print(f"已冻结 phone-01 的 {frozen} 条链，其他设备不受影响")
+    expect("手机的新续期凭据", svc.refresh, phone2.refresh_token,
+           expected=TokenRevokedError)
+    expect("书房电脑继续续期", svc.refresh, laptop2.refresh_token)
+
+    section("8c. 旧续期请求与重新登录交错：只熔断旧链")
+    old = svc.login("赵远征", "Quiet-Fox-904!",
+                    device_id="tablet-01", device_name="客厅平板")
+    rotated_old = svc.refresh(old.refresh_token)
+    fresh = svc.login("赵远征", "Quiet-Fox-904!",
+                      device_id="tablet-01", device_name="客厅平板")
+    expect("交错期间重放平板旧续期凭据", svc.refresh, old.refresh_token,
+           expected=TokenReuseDetectedError)
+    expect("旧链赢家凭据也被熔断", svc.refresh, rotated_old.refresh_token,
+           expected=TokenRevokedError)
+    expect("平板上后来重新登录的会话仍然有效", svc.check_access,
+           fresh.access_token)
+
+    section("8d. 设备重命名不改变既有审计归属")
+    svc.rename_device("赵远征", "tablet-01", "卧室平板")
+    for row in svc.list_devices("赵远征"):
+        print(f"  设备 {row['device_id']}（{row['device_name']}） "
+              f"session={row['session_id']} active={row['active']} "
+              f"原因={row['revoke_reason']}")
+    activity = svc.export_device_activity("赵远征", "tablet-01")
+    print("平板（重命名后）的活动记录仍归属当时的设备名:")
+    for event in activity:
+        print(f"  - {event['kind']:7s} | 设备名快照={event['device_name']} | "
+              f"{event['detail']}")
+
+    section("8e. 账户停用结束全部设备，重开后需重新登录")
+    svc.disable_user("赵远征")
+    print("已停用 赵远征，全部设备会话同时结束:",
+          all(not d["active"] for d in svc.list_devices("赵远征")))
+    svc.enable_user("赵远征")
+    svc.login("赵远征", "Quiet-Fox-904!", device_id="phone-02",
+              device_name="新手机")
+    print("已重开账户；旧链保持撤销，新手机重新登录后列表:",
+          [(d["device_id"], d["active"]) for d in svc.list_devices("赵远征")])
+
+    section("8f. 导出设备活动记录（不含原始凭据）")
+    export = svc.export_device_activity("赵远征")
+    kinds = {}
+    for event in export:
+        kinds[event["kind"]] = kinds.get(event["kind"], 0) + 1
+    print(f"共 {len(export)} 条记录，按类型统计: {kinds}")
+    blob = repr(export)
+    for secret in (phone.refresh_token, laptop.refresh_token,
+                   fresh.access_token):
+        assert secret not in blob
+    print("导出内容只含哈希与元数据，无任何原始凭据")
+
     print("\n全部场景走完：过期 / 撤销 / 停用 / 格式错误均为独立错误类型，"
           "没有伪装成网络失败。")
 

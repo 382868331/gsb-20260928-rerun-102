@@ -42,6 +42,8 @@ class TokenBundle:
     access_expires_at: datetime
     refresh_expires_at: datetime
     family: str
+    session_id: int
+    device_id: str
 
 
 class AuthService:
@@ -67,6 +69,7 @@ class AuthService:
                 "pwd_hash": verifier,
                 "disabled": False,
                 "created_at": _now().isoformat(),
+                "devices": {},
             }
 
     def disable_user(self, username: str) -> None:
@@ -79,10 +82,39 @@ class AuthService:
             for session in data["sessions"].values():
                 if session["username"] == username and not session["revoked"]:
                     self._revoke_session(data, session["id"], "account disabled")
+                    self._record(
+                        data, "revoke", session,
+                        detail="account disabled; session revoked",
+                    )
+
+    def enable_user(self, username: str) -> None:
+        """Reactivate a disabled account.
+
+        Sessions revoked by the disable stay revoked; the user must log in
+        again from each device.
+        """
+        with self.store.transaction() as data:
+            user = data["users"].get(username)
+            if user is None:
+                raise InvalidCredentialsError("unknown user")
+            user["disabled"] = False
 
     # ---- login / logout --------------------------------------------------
 
-    def login(self, username: str, password: str) -> TokenBundle:
+    def login(
+        self,
+        username: str,
+        password: str,
+        device_id: str | None = None,
+        device_name: str | None = None,
+    ) -> TokenBundle:
+        """Start a new session bound to a login device.
+
+        ``device_id`` is the stable identity of the device; every refresh of
+        the resulting chain keeps that identity. ``device_name`` is a
+        display label that can be renamed later without touching the audit
+        attribution of events that already happened.
+        """
         with self.store.transaction() as data:
             user = data["users"].get(username)
             if user is None:
@@ -94,7 +126,18 @@ class AuthService:
                 raise InvalidCredentialsError("password mismatch")
             if user["disabled"]:
                 raise AccountDisabledError("account is disabled")
-            return self._issue_bundle(data, username)
+            device_id = device_id or ("dev_" + secrets.token_hex(8))
+            device_name = device_name or device_id
+            devices = user.setdefault("devices", {})
+            if device_id not in devices:
+                devices[device_id] = {
+                    "name": device_name,
+                    "first_seen_at": _now().isoformat(),
+                }
+            bundle = self._issue_bundle(data, username, device_id)
+            session = data["sessions"][str(bundle.session_id)]
+            self._record(data, "login", session, detail="device login")
+            return bundle
 
     def logout(self, access_token: str) -> None:
         """Revoke the session backing this access token (and its refresh chain)."""
@@ -105,6 +148,72 @@ class AuthService:
             if at is None:
                 raise InvalidTokenError("unknown access token")
             self._revoke_session(data, at["session_id"], "user logout")
+            session = data["sessions"][str(at["session_id"])]
+            self._record(data, "revoke", session, detail="user logout")
+
+    def logout_device(self, username: str, device_id: str) -> int:
+        """Freeze every active session chain of one device only.
+
+        Other devices of the same account keep their sessions. Returns the
+        number of session chains that were revoked.
+        """
+        with self.store.transaction() as data:
+            user = data["users"].get(username)
+            if user is None:
+                raise InvalidCredentialsError("unknown user")
+            frozen = 0
+            for session in data["sessions"].values():
+                if (
+                    session["username"] == username
+                    and session.get("device_id") == device_id
+                    and not session["revoked"]
+                ):
+                    self._revoke_session(data, session["id"], "device frozen by user")
+                    self._record(
+                        data, "revoke", session,
+                        detail="device chain frozen by user",
+                    )
+                    frozen += 1
+            return frozen
+
+    def rename_device(self, username: str, device_id: str, new_name: str) -> None:
+        """Rename a device. Past audit events keep their original attribution."""
+        with self.store.transaction() as data:
+            user = data["users"].get(username)
+            if user is None:
+                raise InvalidCredentialsError("unknown user")
+            device = user.setdefault("devices", {}).get(device_id)
+            if device is None:
+                raise InvalidTokenError("unknown device for this user")
+            device["name"] = new_name
+
+    def list_devices(self, username: str) -> list[dict]:
+        """List the user's login devices and the state of each session chain."""
+        with self.store.connect() as data:
+            user = data["users"].get(username)
+            if user is None:
+                raise InvalidCredentialsError("unknown user")
+            devices = user.get("devices", {})
+            out = []
+            for session in data["sessions"].values():
+                if session["username"] != username:
+                    continue
+                device_id = session.get("device_id")
+                out.append(
+                    {
+                        "session_id": session["id"],
+                        "family": session["family"],
+                        "device_id": device_id,
+                        "device_name": devices.get(device_id, {}).get(
+                            "name", session.get("device_name")
+                        ),
+                        "created_at": session["created_at"],
+                        "active": not session["revoked"],
+                        "revoke_reason": session["revoke_reason"],
+                    }
+                )
+            out.sort(key=lambda row: row["session_id"])
+            return out
 
     # ---- access check ----------------------------------------------------
 
@@ -160,6 +269,15 @@ class AuthService:
                         "detail": detail,
                     }
                 )
+                self._record(
+                    data, "deny", session, detail=detail, presented_hash=th
+                )
+
+            def chain_label() -> str:
+                return (
+                    f"family={cred['family']} session={cred['session_id']} "
+                    f"device={session.get('device_id')}"
+                )
 
             if user is not None and user["disabled"]:
                 record_reuse("use after account disabled")
@@ -174,13 +292,15 @@ class AuthService:
                 record_reuse("replay of consumed refresh credential")
                 self._revoke_session(data, cred["session_id"], "refresh reuse detected")
                 pending_error = TokenReuseDetectedError(
-                    "refresh credential was already used; family revoked"
+                    "refresh credential was already used; froze chain "
+                    + chain_label()
                 )
 
             if pending_error is None and (cred["revoked"] or session["revoked"]):
                 record_reuse("use of revoked refresh credential")
-                self._revoke_session(data, cred["session_id"], "revoked credential used")
-                pending_error = TokenRevokedError("refresh credential revoked")
+                pending_error = TokenRevokedError(
+                    "refresh credential revoked; chain " + chain_label()
+                )
 
             if pending_error is None:
                 now = _now()
@@ -216,6 +336,12 @@ class AuthService:
                     access_expires_at=now + self.access_ttl,
                     refresh_expires_at=now + self.refresh_ttl,
                     family=family,
+                    session_id=session_id,
+                    device_id=session.get("device_id"),
+                )
+                self._record(
+                    data, "refresh", session,
+                    detail="rotated refresh credential; device identity kept",
                 )
         if pending_error is not None:
             raise pending_error
@@ -232,7 +358,47 @@ class AuthService:
                 events = [e for e in events if e["family"] == family]
             return [dict(e) for e in events]
 
+    def export_device_activity(
+        self, username: str | None = None, device_id: str | None = None
+    ) -> list[dict]:
+        """Export the device activity log without any raw credentials.
+
+        Each record is one of login / refresh / revoke / deny and carries
+        the device attribution as it was when the event happened (later
+        renames do not rewrite history).
+        """
+        with self.store.connect() as data:
+            events = data.get("activity", [])
+            if username is not None:
+                events = [e for e in events if e["username"] == username]
+            if device_id is not None:
+                events = [e for e in events if e["device_id"] == device_id]
+            return [dict(e) for e in events]
+
     # ---- internals -------------------------------------------------------
+
+    @staticmethod
+    def _record(
+        data: dict,
+        kind: str,
+        session: dict,
+        detail: str,
+        presented_hash: str | None = None,
+    ) -> None:
+        """Append a device activity record. Never stores raw credentials."""
+        data.setdefault("activity", []).append(
+            {
+                "observed_at": _now().isoformat(),
+                "kind": kind,
+                "username": session["username"],
+                "session_id": session["id"],
+                "family": session["family"],
+                "device_id": session.get("device_id"),
+                "device_name": session.get("device_name"),
+                "detail": detail,
+                "presented_hash": presented_hash,
+            }
+        )
 
     @staticmethod
     def _check_shape(token: str, expect_prefix: str) -> None:
@@ -243,17 +409,28 @@ class AuthService:
                 f"expected a {expect_prefix.rstrip('_')} credential"
             )
 
-    def _issue_bundle(self, data: dict, username: str) -> TokenBundle:
+    def _issue_bundle(
+        self, data: dict, username: str, device_id: str | None = None
+    ) -> TokenBundle:
         now = _now()
         family = secrets.token_hex(16)
         access = "at_" + secrets.token_urlsafe(32)
         refresh = "rf_" + secrets.token_urlsafe(32)
         data["seq"] += 1
         session_id = data["seq"]
+        device_name = None
+        if device_id is not None:
+            device_name = (
+                data["users"][username].get("devices", {})
+                .get(device_id, {})
+                .get("name", device_id)
+            )
         data["sessions"][str(session_id)] = {
             "id": session_id,
             "username": username,
             "family": family,
+            "device_id": device_id,
+            "device_name": device_name,
             "created_at": now.isoformat(),
             "revoked": False,
             "revoke_reason": None,
@@ -283,6 +460,8 @@ class AuthService:
             access_expires_at=now + self.access_ttl,
             refresh_expires_at=now + self.refresh_ttl,
             family=family,
+            session_id=session_id,
+            device_id=device_id,
         )
 
     @staticmethod

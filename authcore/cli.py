@@ -2,12 +2,17 @@
 
 Examples:
     python -m authcore.cli --db a.json add-user alice pw
-    python -m authcore.cli --db a.json login    alice pw
+    python -m authcore.cli --db a.json login    alice pw --device-id phone-1 --device-name 手机
     python -m authcore.cli --db a.json check    at_...
     python -m authcore.cli --db a.json refresh  rf_...
     python -m authcore.cli --db a.json logout   at_...
+    python -m authcore.cli --db a.json devices  alice
+    python -m authcore.cli --db a.json freeze   alice phone-1
+    python -m authcore.cli --db a.json rename-device alice phone-1 新手机
     python -m authcore.cli --db a.json disable  alice
+    python -m authcore.cli --db a.json enable   alice
     python -m authcore.cli --db a.json events
+    python -m authcore.cli --db a.json activity [alice]
 
 Exit code 0 means allowed; non-zero means rejected. The error type (never a
 generic network failure) is printed to stderr.
@@ -28,11 +33,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", default="authcore.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("add-user").add_argument("args", nargs=2)
-    sub.add_parser("login").add_argument("args", nargs=2)
+    login_p = sub.add_parser("login")
+    login_p.add_argument("args", nargs=2)
+    login_p.add_argument("--device-id", default=None)
+    login_p.add_argument("--device-name", default=None)
     for name in ("check", "refresh", "logout"):
         sub.add_parser(name).add_argument("args", nargs=1)
     sub.add_parser("disable").add_argument("args", nargs=1)
+    sub.add_parser("enable").add_argument("args", nargs=1)
+    sub.add_parser("devices").add_argument("args", nargs=1)
+    sub.add_parser("freeze").add_argument("args", nargs=2)
+    sub.add_parser("rename-device").add_argument("args", nargs=3)
     sub.add_parser("events")
+    sub.add_parser("activity").add_argument("args", nargs="?")
     ns = parser.parse_args(argv)
 
     svc = AuthService(ns.db)
@@ -42,10 +55,12 @@ def main(argv: list[str] | None = None) -> int:
             svc.create_user(args[0], args[1])
             print(json.dumps({"ok": True, "created": args[0]}, ensure_ascii=False))
         elif ns.cmd == "login":
-            b = svc.login(args[0], args[1])
+            b = svc.login(args[0], args[1], device_id=ns.device_id,
+                          device_name=ns.device_name)
             print(json.dumps({"ok": True, "access_token": b.access_token,
                              "refresh_token": b.refresh_token,
-                             "family": b.family}, ensure_ascii=False))
+                             "family": b.family, "session_id": b.session_id,
+                             "device_id": b.device_id}, ensure_ascii=False))
         elif ns.cmd == "check":
             print(json.dumps({"ok": True, "username": svc.check_access(args[0])},
                              ensure_ascii=False))
@@ -60,8 +75,23 @@ def main(argv: list[str] | None = None) -> int:
         elif ns.cmd == "disable":
             svc.disable_user(args[0])
             print(json.dumps({"ok": True, "disabled": args[0]}, ensure_ascii=False))
+        elif ns.cmd == "enable":
+            svc.enable_user(args[0])
+            print(json.dumps({"ok": True, "enabled": args[0]}, ensure_ascii=False))
+        elif ns.cmd == "devices":
+            print(json.dumps(svc.list_devices(args[0]), ensure_ascii=False, indent=1))
+        elif ns.cmd == "freeze":
+            frozen = svc.logout_device(args[0], args[1])
+            print(json.dumps({"ok": True, "frozen_chains": frozen},
+                             ensure_ascii=False))
+        elif ns.cmd == "rename-device":
+            svc.rename_device(args[0], args[1], args[2])
+            print(json.dumps({"ok": True, "renamed": args[1]}, ensure_ascii=False))
         elif ns.cmd == "events":
             print(json.dumps(svc.list_reuse_events(), ensure_ascii=False, indent=1))
+        elif ns.cmd == "activity":
+            print(json.dumps(svc.export_device_activity(args[0] if args else None),
+                             ensure_ascii=False, indent=1))
     except AuthError as exc:
         print(json.dumps({"ok": False, "error": type(exc).__name__,
                           "message": str(exc)}, ensure_ascii=False), file=sys.stderr)

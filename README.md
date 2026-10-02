@@ -16,6 +16,15 @@
   重启后仍然有效。
 - 重用审计：`reuse` 表记录观察时间、家族、会话、用户、凭据序号、**所呈
   交凭据的 SHA-256 哈希**和原因；不含原始凭据，可通过 API 或 CLI 查询。
+- 按登录设备管理会话：登录可携带稳定的 `device_id` 与显示名，每次续期
+  沿用该设备身份；`logout_device` 只冻结指定设备的会话链，不影响其他
+  设备；账户停用仍同时结束全部会话，`enable_user` 重开后旧链保持撤销。
+- 交错重放定位：旧续期请求与重新登录交错时，重用熔断只撤销被重放的
+  那条链（错误信息注明 family / session / device），后来重新登录的
+  会话不受影响。
+- 设备活动导出：`activity` 表区分 `login` / `refresh` / `revoke` /
+  `deny` 四类事件，只含哈希与元数据；设备重命名只改显示名，不改既有
+  审计记录中的设备归属快照。
 
 ## 错误类型（不伪装成网络失败）
 
@@ -32,12 +41,17 @@ python -m unittest discover -s tests   # 8 个测试
 python run_demo.py                      # 完整虚构用户演示
 
 python -m authcore.cli --db demo.json add-user alice 'S3cret!'
-python -m authcore.cli --db demo.json login    alice 'S3cret!'
+python -m authcore.cli --db demo.json login    alice 'S3cret!' --device-id phone-1 --device-name 手机
 python -m authcore.cli --db demo.json check    at_...
 python -m authcore.cli --db demo.json refresh  rf_...
 python -m authcore.cli --db demo.json logout   at_...
+python -m authcore.cli --db demo.json devices  alice
+python -m authcore.cli --db demo.json freeze   alice phone-1
+python -m authcore.cli --db demo.json rename-device alice phone-1 新手机
 python -m authcore.cli --db demo.json disable  alice
+python -m authcore.cli --db demo.json enable   alice
 python -m authcore.cli --db demo.json events
+python -m authcore.cli --db demo.json activity [alice]
 ```
 
 ## 文件
@@ -46,5 +60,7 @@ python -m authcore.cli --db demo.json events
 - `authcore/store.py`：带 `flock` 锁的 JSON 持久化（线程/进程安全）。
 - `authcore/errors.py`：分类错误。
 - `authcore/cli.py`：命令行入口。
-- `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化等测试。
-- `run_demo.py`：虚构用户全流程演示（中文输出）。
+- `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化、
+  多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计
+  归属等测试。
+- `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理场景。

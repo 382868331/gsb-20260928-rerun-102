@@ -156,5 +156,138 @@ class AuthCoreTest(unittest.TestCase):
         self.assertNotIn("password", repr(event))
 
 
+class DeviceSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "auth.db")
+        self.svc = AuthService(self.db, timedelta(seconds=2), timedelta(seconds=10))
+        self.svc.create_user("alice", "pw-alice")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def login(self, device_id, name):
+        return self.svc.login("alice", "pw-alice",
+                              device_id=device_id, device_name=name)
+
+    def test_refresh_keeps_device_identity(self):
+        phone = self.login("phone-1", "小手机")
+        rotated = self.svc.refresh(phone.refresh_token)
+        self.assertEqual(rotated.device_id, "phone-1")
+        self.assertEqual(rotated.session_id, phone.session_id)
+        devices = self.svc.list_devices("alice")
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["device_name"], "小手机")
+        self.assertTrue(devices[0]["active"])
+
+    def test_freeze_one_device_keeps_others(self):
+        phone = self.login("phone-1", "小手机")
+        laptop = self.login("laptop-1", "旧电脑")
+        frozen = self.svc.logout_device("alice", "phone-1")
+        self.assertEqual(frozen, 1)
+        with self.assertRaises(TokenRevokedError):
+            self.svc.check_access(phone.access_token)
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(phone.refresh_token)
+        # The other device is untouched and can still refresh.
+        self.assertEqual(self.svc.check_access(laptop.access_token), "alice")
+        rotated = self.svc.refresh(laptop.refresh_token)
+        self.assertEqual(rotated.device_id, "laptop-1")
+        states = {d["device_id"]: d["active"]
+                  for d in self.svc.list_devices("alice")}
+        self.assertEqual(states, {"phone-1": False, "laptop-1": True})
+
+    def test_reuse_freezes_old_chain_not_relogin(self):
+        # Old refresh credential races with a fresh login on the same device.
+        old = self.login("phone-1", "小手机")
+        rotated = self.svc.refresh(old.refresh_token)
+        fresh = self.login("phone-1", "小手机")  # user logs in again
+        with self.assertRaises(TokenReuseDetectedError) as ctx:
+            self.svc.refresh(old.refresh_token)  # replay of the old chain
+        message = str(ctx.exception)
+        self.assertIn(old.family, message)
+        self.assertIn(str(old.session_id), message)
+        # Only the stale chain is frozen; the newer login survives.
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(rotated.refresh_token)
+        self.assertEqual(self.svc.check_access(fresh.access_token), "alice")
+        self.assertEqual(self.svc.refresh(fresh.refresh_token).device_id, "phone-1")
+        devices = self.svc.list_devices("alice")
+        by_session = {d["session_id"]: d["active"] for d in devices}
+        self.assertFalse(by_session[old.session_id])
+        self.assertTrue(by_session[fresh.session_id])
+
+    def test_disable_ends_all_devices_and_enable_allows_relogin(self):
+        phone = self.login("phone-1", "小手机")
+        laptop = self.login("laptop-1", "旧电脑")
+        self.svc.disable_user("alice")
+        for bundle in (phone, laptop):
+            with self.assertRaises(AccountDisabledError):
+                self.svc.check_access(bundle.access_token)
+        self.assertFalse(any(d["active"] for d in self.svc.list_devices("alice")))
+        self.svc.enable_user("alice")
+        # Old chains stay revoked after re-enabling; a new login works.
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(phone.refresh_token)
+        again = self.login("phone-1", "小手机")
+        self.assertEqual(self.svc.check_access(again.access_token), "alice")
+
+    def test_rename_device_keeps_audit_attribution(self):
+        phone = self.login("phone-1", "小手机")
+        self.svc.refresh(phone.refresh_token)
+        self.svc.rename_device("alice", "phone-1", "新手机")
+        # Listing shows the new name...
+        self.assertEqual(self.svc.list_devices("alice")[0]["device_name"], "新手机")
+        # ...but earlier audit records still carry the original name.
+        activity = self.svc.export_device_activity("alice", "phone-1")
+        kinds = [e["kind"] for e in activity]
+        self.assertEqual(kinds, ["login", "refresh"])
+        self.assertTrue(all(e["device_name"] == "小手机" for e in activity))
+        self.assertTrue(all(e["device_id"] == "phone-1" for e in activity))
+
+    def test_activity_export_distinguishes_kinds_and_hides_secrets(self):
+        phone = self.login("phone-1", "小手机")
+        rotated = self.svc.refresh(phone.refresh_token)
+        with self.assertRaises(TokenReuseDetectedError):
+            self.svc.refresh(phone.refresh_token)
+        laptop = self.login("laptop-1", "旧电脑")
+        self.assertEqual(self.svc.logout_device("alice", "laptop-1"), 1)
+        activity = self.svc.export_device_activity("alice")
+        kinds = [e["kind"] for e in activity]
+        self.assertEqual(kinds, ["login", "refresh", "deny", "login", "revoke"])
+        laptop_events = self.svc.export_device_activity("alice", "laptop-1")
+        self.assertEqual([e["kind"] for e in laptop_events], ["login", "revoke"])
+        blob = repr(activity)
+        self.assertNotIn(phone.refresh_token, blob)
+        self.assertNotIn(rotated.refresh_token, blob)
+        self.assertNotIn(phone.access_token, blob)
+        self.assertNotIn(laptop.refresh_token, blob)
+        deny = activity[2]
+        self.assertEqual(deny["presented_hash"],
+                         hash_credential(phone.refresh_token))
+
+    def test_concurrent_refresh_across_devices(self):
+        bundles = [self.login("dev-%d" % i, "设备%d" % i) for i in range(3)]
+        barrier = threading.Barrier(len(bundles))
+        outcomes = []
+
+        def rotate(bundle):
+            barrier.wait()
+            try:
+                outcomes.append(self.svc.refresh(bundle.refresh_token))
+            except BaseException as exc:  # noqa: BLE001
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=rotate, args=(b,)) for b in bundles]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Distinct devices have independent chains: all three rotations win.
+        self.assertTrue(all(not isinstance(o, BaseException) for o in outcomes))
+        self.assertEqual({o.device_id for o in outcomes},
+                         {"dev-0", "dev-1", "dev-2"})
+
+
 if __name__ == "__main__":
     unittest.main()

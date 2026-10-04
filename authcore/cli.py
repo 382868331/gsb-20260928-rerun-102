@@ -43,6 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("enable").add_argument("args", nargs=1)
     sub.add_parser("devices").add_argument("args", nargs=1)
     sub.add_parser("freeze").add_argument("args", nargs=2)
+    rotate_p = sub.add_parser("rotate")
+    rotate_p.add_argument("args", nargs=3)
+    rotate_p.add_argument("--device-name", default=None)
+    rotate_p.add_argument("--winddown-seconds", type=int, default=None)
+    frz_p = sub.add_parser("freeze-emergency")
+    frz_p.add_argument("args", nargs=2, metavar=("USER", "DEVICE"))
+    frz_p.add_argument("--reason", default="suspected leak")
+    sub.add_parser("lineage").add_argument("args", nargs=2)
     sub.add_parser("rename-device").add_argument("args", nargs=3)
     sub.add_parser("events")
     sub.add_parser("activity").add_argument("args", nargs="?")
@@ -84,6 +92,36 @@ def main(argv: list[str] | None = None) -> int:
             frozen = svc.logout_device(args[0], args[1])
             print(json.dumps({"ok": True, "frozen_chains": frozen},
                              ensure_ascii=False))
+        elif ns.cmd == "rotate":
+            from datetime import timedelta
+            winddown = (timedelta(seconds=ns.winddown_seconds)
+                        if ns.winddown_seconds is not None else None)
+            result = svc.rotate_device_credentials(
+                args[0], args[1], args[2],
+                device_name=ns.device_name, winddown=winddown,
+            )
+            b = result["bundle"]
+            print(json.dumps({
+                "ok": True,
+                "access_token": b.access_token,
+                "refresh_token": b.refresh_token,
+                "family": b.family,
+                "session_id": b.session_id,
+                "device_id": b.device_id,
+                "lineage_id": result["lineage_id"],
+                "generation": result["generation"],
+                "rotation_id": result["rotation_id"],
+                "retired_sessions": result["retired_sessions"],
+                "winddown_until": result["winddown_until"].isoformat(),
+                "rule": result["rule"],
+            }, ensure_ascii=False))
+        elif ns.cmd == "freeze-emergency":
+            print(json.dumps(svc.emergency_freeze_device(
+                args[0], args[1], reason=ns.reason),
+                             ensure_ascii=False))
+        elif ns.cmd == "lineage":
+            print(json.dumps(svc.device_lineage(args[0], args[1]),
+                             ensure_ascii=False, indent=1))
         elif ns.cmd == "rename-device":
             svc.rename_device(args[0], args[1], args[2])
             print(json.dumps({"ok": True, "renamed": args[1]}, ensure_ascii=False))

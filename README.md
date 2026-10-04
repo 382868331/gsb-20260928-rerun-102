@@ -23,14 +23,31 @@
   那条链（错误信息注明 family / session / device），后来重新登录的
   会话不受影响。
 - 设备活动导出：`activity` 表区分 `login` / `refresh` / `revoke` /
-  `deny` 四类事件，只含哈希与元数据；设备重命名只改显示名，不改既有
-  审计记录中的设备归属快照。
+  `deny` / `rotate` 五类事件，只含哈希与元数据；设备重命名只改显示名，
+  不改既有审计记录中的设备归属快照。
+- 设备凭据换代（rotation）：`rotate_device_credentials` 在同一设备上
+  签发全新登录家族（新 `family`），旧链按换代前固定显示的规则收尾——
+  旧续期凭据立刻不能再创建续期，已签发的旧访问凭据在收尾窗口
+  （wind-down）内仍可用，窗口后到达的在途请求拒绝；旧链请求一律不触发
+  家族熔断，因此迟到的旧响应绝不可能冻结新链。
+- 计划换代 vs 怀疑泄露：`emergency_freeze_device` 立即撤销该设备全部
+  未完成授权（包括尚在收尾窗口内的旧链与活动新链），无宽限；只影响
+  该设备，其他设备与其他用户不受牵连。换代、重用告警与账户停用交错
+  时最终撤销范围可查；账户重开不复活任何旧链，需重新登录，重新登录
+  仍挂接同一设备谱系。
+- 历代登录身份：每个设备有稳定 `lineage_id` 与递增 `generation`，链与
+  链之间以 `predecessor_session / replaced_by_session` 串联；
+  `device_lineage` 返回每代链的状态（active / winding_down / retired /
+  revoked）、拒绝原因与仍有效范围（仅已签发的访问凭据、不能续期），
+  持久化重开后仍一一对应。
 
 ## 错误类型（不伪装成网络失败）
 
 `MalformedTokenError`（格式错误）、`InvalidTokenError`（未知凭据）、
 `TokenExpiredError`（过期）、`TokenRevokedError`（撤销）、
 `TokenReuseDetectedError`（续期凭据重用，家族熔断）、
+`ChainSupersededError`（旧链已被计划换代取代，拒绝新续期但不熔断新链）、
+`ChainWoundDownError`（旧链在途请求晚于收尾截止时间）、
 `AccountDisabledError`（账户停用）、`InvalidCredentialsError`（用户名/口令
 错误），均继承自 `AuthError`。
 
@@ -48,6 +65,9 @@ python -m authcore.cli --db demo.json logout   at_...
 python -m authcore.cli --db demo.json devices  alice
 python -m authcore.cli --db demo.json freeze   alice phone-1
 python -m authcore.cli --db demo.json rename-device alice phone-1 新手机
+python -m authcore.cli --db demo.json rotate   alice phone-1 'S3cret!' --winddown-seconds 900
+python -m authcore.cli --db demo.json freeze-emergency alice phone-1 --reason 'suspected leak'
+python -m authcore.cli --db demo.json lineage  alice phone-1
 python -m authcore.cli --db demo.json disable  alice
 python -m authcore.cli --db demo.json enable   alice
 python -m authcore.cli --db demo.json events
@@ -62,5 +82,8 @@ python -m authcore.cli --db demo.json activity [alice]
 - `authcore/cli.py`：命令行入口。
 - `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化、
   多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计
-  归属等测试。
-- `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理场景。
+  归属，以及计划换代与收尾窗口、连续换代、旧请求乱序返回、同设备旧链
+  并发续期、怀疑泄露立即冻结、换代/重用/停用交错撤销范围、重开后谱系
+  还原等测试。
+- `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理与设备
+  凭据换代场景。

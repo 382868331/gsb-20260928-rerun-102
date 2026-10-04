@@ -1,5 +1,7 @@
 from .errors import (
     AccountDisabledError,
+    ChainSupersededError,
+    ChainWoundDownError,
     AuthError,
     InvalidCredentialsError,
     InvalidTokenError,
@@ -20,5 +22,7 @@ __all__ = [
     "TokenExpiredError",
     "TokenRevokedError",
     "TokenReuseDetectedError",
+    "ChainSupersededError",
+    "ChainWoundDownError",
     "AccountDisabledError",
 ]

@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from authcore.service import hash_credential
 from authcore import (
     AccountDisabledError,
+    ChainSupersededError,
+    ChainWoundDownError,
     AuthService,
     InvalidCredentialsError,
     InvalidTokenError,
@@ -29,6 +31,18 @@ class AuthCoreTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def login(self, device_id, device_name=None):
+        return self.svc.login(
+            "alice", "correct horse battery staple",
+            device_id=device_id, device_name=device_name,
+        )
+
+    def rotate(self, device_id, winddown=timedelta(seconds=5)):
+        return self.svc.rotate_device_credentials(
+            "alice", device_id, "correct horse battery staple",
+            winddown=winddown,
+        )
 
     def test_login_and_access_check(self):
         bundle = self.svc.login("alice", "correct horse battery staple")
@@ -286,7 +300,158 @@ class DeviceSessionTest(unittest.TestCase):
         # Distinct devices have independent chains: all three rotations win.
         self.assertTrue(all(not isinstance(o, BaseException) for o in outcomes))
         self.assertEqual({o.device_id for o in outcomes},
-                         {"dev-0", "dev-1", "dev-2"})
+                        {"dev-0", "dev-1", "dev-2"})
+
+
+class RotationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "auth.db")
+        self.svc = AuthService(self.db, timedelta(seconds=2), timedelta(seconds=10))
+        self.svc.create_user("alice", "pw-alice")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def login(self, device_id, device_name=None):
+        return self.svc.login("alice", "pw-alice",
+                              device_id=device_id, device_name=device_name)
+
+    def rotate(self, device_id, winddown=timedelta(seconds=5)):
+        return self.svc.rotate_device_credentials(
+            "alice", device_id, "pw-alice", winddown=winddown,
+        )
+
+    def test_planned_rotation_keeps_lineage_and_winddown_rule(self):
+        old = self.login("phone", "旧手机")
+        result = self.rotate("phone")
+        new = result["bundle"]
+        self.assertEqual(new.device_id, "phone")
+        self.assertNotEqual(new.family, old.family)
+        from authcore.service import ROTATION_RULE
+        self.assertEqual(result["rule"], ROTATION_RULE)
+        self.assertEqual(result["retired_sessions"], [old.session_id])
+        self.assertEqual(self.svc.check_access(old.access_token), "alice")
+        with self.assertRaises(ChainSupersededError):
+            self.svc.refresh(old.refresh_token)
+        rotated = self.svc.refresh(new.refresh_token)
+        self.assertEqual(self.svc.check_access(rotated.access_token), "alice")
+
+    def test_old_request_out_of_order_after_winddown_is_denied_not_frozen(self):
+        old = self.login("phone")
+        result = self.rotate("phone", winddown=timedelta(milliseconds=50))
+        new = result["bundle"]
+        import time
+        time.sleep(0.08)
+        with self.assertRaises(ChainWoundDownError):
+            self.svc.check_access(old.access_token)
+        self.assertEqual(self.svc.check_access(new.access_token), "alice")
+
+    def test_consecutive_rotations_link_all_generations(self):
+        first = self.login("phone")
+        r1 = self.rotate("phone")
+        r2 = self.rotate("phone")
+        self.assertEqual(r1["generation"], 1)
+        self.assertEqual(r2["generation"], 2)
+        self.assertEqual(r1["lineage_id"], r2["lineage_id"])
+        with self.assertRaises(ChainSupersededError):
+            self.svc.refresh(first.refresh_token)
+        with self.assertRaises(ChainSupersededError):
+            self.svc.refresh(r1["bundle"].refresh_token)
+        newest = self.svc.refresh(r2["bundle"].refresh_token)
+        self.assertEqual(newest.device_id, "phone")
+        lineage = self.svc.device_lineage("alice", "phone")
+        states = [(c["generation"], c["state"]) for c in lineage["chains"]]
+        self.assertEqual([s for _, s in states],
+                         ["winding_down", "winding_down", "active"])
+        self.assertTrue(all(c["family"] for c in lineage["chains"]))
+
+    def test_concurrent_refresh_on_same_chain_after_rotation(self):
+        old = self.login("phone")
+        new = self.rotate("phone")["bundle"]
+        barrier = threading.Barrier(4)
+        outcomes = []
+
+        def attempt(token, expect_old):
+            barrier.wait()
+            try:
+                outcomes.append((expect_old, self.svc.refresh(token)))
+            except BaseException as exc:  # noqa: BLE001
+                outcomes.append((expect_old, exc))
+
+        threads = [
+            threading.Thread(target=attempt, args=(old.refresh_token, True))
+            for _ in range(3)
+        ] + [threading.Thread(target=attempt, args=(new.refresh_token, False))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        old_outcomes = [o for is_old, o in outcomes if is_old]
+        new_outcomes = [o for is_old, o in outcomes if not is_old]
+        self.assertEqual(len(old_outcomes), 3)
+        self.assertTrue(all(isinstance(o, ChainSupersededError) for o in old_outcomes))
+        self.assertEqual(len(new_outcomes), 1)
+        self.assertFalse(isinstance(new_outcomes[0], BaseException))
+
+    def test_emergency_freeze_revokes_unfinished_and_keeps_other_devices(self):
+        phone_old = self.login("phone")
+        result = self.rotate("phone")
+        phone_new = result["bundle"]
+        watch = self.login("watch", "手表")
+        report = self.svc.emergency_freeze_device("alice", "phone")
+        self.assertEqual(report["cancelled_winddown_chains"], 1)
+        self.assertEqual(report["revoked_active_chains"], 1)
+        for token in (phone_old.access_token, phone_new.access_token):
+            with self.assertRaises(TokenRevokedError):
+                self.svc.check_access(token)
+        for token in (phone_old.refresh_token, phone_new.refresh_token):
+            with self.assertRaises(TokenRevokedError):
+                self.svc.refresh(token)
+        self.assertEqual(self.svc.check_access(watch.access_token), "alice")
+        self.assertEqual(self.svc.refresh(watch.refresh_token).device_id, "watch")
+
+    def test_rotation_reuse_and_disable_interleave_scope(self):
+        phone = self.login("phone")
+        rotated = self.rotate("phone")["bundle"]
+        watch = self.login("watch")
+        with self.assertRaises(ChainSupersededError):
+            self.svc.refresh(phone.refresh_token)
+        self.assertEqual(self.svc.check_access(rotated.access_token), "alice")
+        self.svc.disable_user("alice")
+        for bundle in (phone, rotated, watch):
+            with self.assertRaises((AccountDisabledError, TokenRevokedError)):
+                self.svc.check_access(bundle.access_token)
+        self.svc.enable_user("alice")
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(rotated.refresh_token)
+        relogin = self.login("phone")
+        self.assertEqual(self.svc.check_access(relogin.access_token), "alice")
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(rotated.refresh_token)
+
+    def test_lineage_persists_with_denies_and_scopes_after_reopen(self):
+        old = self.login("phone", "手机")
+        rotated = self.rotate("phone")["bundle"]
+        with self.assertRaises(ChainSupersededError):
+            self.svc.refresh(old.refresh_token)
+        reopened = AuthService(self.db, timedelta(seconds=2), timedelta(seconds=10))
+        lineage = reopened.device_lineage("alice", "phone")
+        self.assertEqual(len(lineage["chains"]), 2)
+        self.assertEqual(lineage["chains"][0]["state"], "winding_down")
+        self.assertEqual(
+            lineage["chains"][0]["valid_scope"],
+            "already-issued access credentials only; no renewals",
+        )
+        self.assertEqual(lineage["chains"][1]["state"], "active")
+        self.assertTrue(
+            lineage["denies"][0]["detail"].startswith("renewal attempted on chain")
+        )
+        self.assertEqual(lineage["chains"][1]["family"], rotated.family)
+        for event in reopened.export_device_activity("alice", "phone"):
+            self.assertNotIn("refresh_token", event)
+            self.assertNotIn("access_token", event)
+            self.assertEqual(event["device_id"], "phone")
 
 
 if __name__ == "__main__":

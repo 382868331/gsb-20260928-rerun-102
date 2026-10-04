@@ -15,6 +15,8 @@ from authcore import (
     AccountDisabledError,
     AuthError,
     AuthService,
+    ChainSupersededError,
+    ChainWoundDownError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
@@ -228,6 +230,119 @@ def main() -> None:
                    fresh.access_token):
         assert secret not in blob
     print("导出内容只含哈希与元数据，无任何原始凭据")
+
+    section("9. 设备凭据换代：计划换代与怀疑泄露的立即冻结")
+    rot_db = DATA_DIR / "rotation.json"
+    rsvc = AuthService(str(rot_db), access_ttl=timedelta(hours=1),
+                       refresh_ttl=timedelta(hours=1))
+    rsvc.create_user("陈屿", "Velvet-Heron-338!")
+    dev = expect("陈屿在平板上登录（第 0 代链）",
+                 lambda: rsvc.login("陈屿", "Velvet-Heron-338!",
+                                    device_id="tab-77",
+                                    device_name="随身平板"))
+    in_flight_access = dev.access_token
+    in_flight_refresh = dev.refresh_token
+
+    section("9a. 第一次计划换代：事先显示换代规则")
+    r1 = rsvc.rotate_device_credentials(
+        "陈屿", "tab-77", "Velvet-Heron-338!",
+        winddown=timedelta(seconds=2),
+    )
+    gen1 = r1["bundle"]
+    print(f"换代 {r1['rotation_id']} 生效，谱系 {r1['lineage_id']} "
+          f"进入第 {r1['generation']} 代")
+    print("事先显示的换代规则:", r1["rule"])
+    print(f"旧链收尾截止: {r1['winddown_until'].isoformat()}")
+    expect("已在途的旧访问请求（窗口内）", rsvc.check_access, in_flight_access)
+    expect("旧链发起新的续期（立即拒绝，不熔断新链）",
+           rsvc.refresh, in_flight_refresh, expected=ChainSupersededError)
+    expect("新链自身续期正常", rsvc.refresh, gen1.refresh_token)
+
+    section("9b. 连续第二次换代 + 旧请求乱序返回")
+    r2 = rsvc.rotate_device_credentials(
+        "陈屿", "tab-77", "Velvet-Heron-338!",
+        winddown=timedelta(seconds=2),
+    )
+    gen2 = r2["bundle"]
+    print(f"第二次换代 {r2['rotation_id']}，第 {r2['generation']} 代；"
+          "各代旧链并存于各自收尾窗口")
+    expect("更老的访问请求更晚到达（仍在窗口 => 接受）",
+           rsvc.check_access, in_flight_access)
+    expect("第一代旧链乱序续期（按规则拒绝）",
+           rsvc.refresh, gen1.refresh_token, expected=ChainSupersededError)
+    expect("最新链续期", rsvc.refresh, gen2.refresh_token)
+    print("等待收尾窗口关闭（2.2 秒）…")
+    threading.Event().wait(2.2)
+    expect("窗口关闭后旧访问请求才到达（拒绝，不冻结新链）",
+           rsvc.check_access, in_flight_access, expected=ChainWoundDownError)
+    expect("最新链不受迟到旧请求牵连", rsvc.check_access, gen2.access_token)
+
+    section("9c. 同设备旧续期并发：全部按换代规则拒绝")
+    r3 = rsvc.rotate_device_credentials(
+        "陈屿", "tab-77", "Velvet-Heron-338!",
+        winddown=timedelta(seconds=30),
+    )
+    gen3 = r3["bundle"]
+    barrier3 = threading.Barrier(3)
+    outcomes3: list[object] = []
+
+    def race_old(token):
+        barrier3.wait()
+        try:
+            outcomes3.append(rsvc.refresh(token))
+        except AuthError as exc:
+            outcomes3.append(exc)
+
+    ts3 = [threading.Thread(target=race_old, args=(gen2.refresh_token,))
+           for _ in range(3)]
+    for t in ts3:
+        t.start()
+    for t in ts3:
+        t.join()
+    kinds3 = {type(o).__name__ for o in outcomes3}
+    print("3 个并发旧续期结果:", kinds3, "（全部 ChainSupersededError）")
+    gen3_live = expect("新链依旧可续期", rsvc.refresh, gen3.refresh_token)
+
+    section("9d. 怀疑泄露：立即冻结撤销该设备全部未完成授权")
+    watch_b = rsvc.login("陈屿", "Velvet-Heron-338!",
+                         device_id="watch-9", device_name="手表")
+    report = rsvc.emergency_freeze_device("陈屿", "tab-77",
+                                          reason="refresh credential leaked")
+    print(f"事件 {report['incident_id']}: 撤销活动链 "
+          f"{report['revoked_active_chains']} 条，取消收尾窗口 "
+          f"{report['cancelled_winddown_chains']} 条；{report['scope']}")
+    expect("平板旧访问凭据", rsvc.check_access, in_flight_access,
+           expected=TokenRevokedError)
+    expect("平板最新链访问凭据", rsvc.check_access, gen3.access_token,
+           expected=TokenRevokedError)
+    expect("手表访问不受牵连", rsvc.check_access, watch_b.access_token)
+
+    section("9e. 换代 / 重用告警 / 停用交错后的最终撤销范围")
+    other = svc.login("赵远征", "Quiet-Fox-904!", device_id="lap-x",
+                      device_name="备用电脑")
+    rsvc.disable_user("陈屿")
+    rsvc.enable_user("陈屿")
+    expect("重开账户不复活被冻结的平板链", rsvc.refresh, gen3_live.refresh_token,
+            expected=TokenRevokedError)
+    expect("停用不影响其他用户的设备", svc.check_access, other.access_token)
+    relogin = rsvc.login("陈屿", "Velvet-Heron-338!",
+                         device_id="tab-77", device_name="随身平板")
+    print("平板重新认证后获得新链，谱系保持连续: "
+          f"lineage={r3['lineage_id']}")
+
+    section("9f. 保存重开后查看历代登录身份 / 拒绝原因 / 仍有效范围")
+    restarted2 = AuthService(str(rot_db), access_ttl=timedelta(hours=1),
+                             refresh_ttl=timedelta(hours=1))
+    lineage = restarted2.device_lineage("陈屿", "tab-77")
+    print(f"设备谱系 {lineage['lineage_id']}，共 {len(lineage['chains'])} 代:")
+    for chain in lineage["chains"]:
+        print(f"  gen={chain['generation']} session={chain['session_id']} "
+              f"状态={chain['state']} 原因={chain['revoke_reason']} "
+              f"有效范围={chain['valid_scope']} "
+              f"前代={chain['predecessor_session']} "
+              f"后继={chain['replaced_by_session']}")
+    print(f"拒绝记录 {len(lineage['denies'])} 条，例如: "
+          f"{lineage['denies'][0]['detail']}")
 
     print("\n全部场景走完：过期 / 撤销 / 停用 / 格式错误均为独立错误类型，"
           "没有伪装成网络失败。")

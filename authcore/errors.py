@@ -34,5 +34,24 @@ class TokenReuseDetectedError(TokenRevokedError):
     """A consumed refresh credential was presented again.
 
     Presenting this error means the entire refresh family has been revoked,
-    which is the correct response to a stolen/old refresh credential.
+        which is the correct response to a stolen/old refresh credential.
+    """
+
+
+class ChainSupersededError(TokenRevokedError):
+    """A credential from a chain retired by a planned device rotation.
+
+    The old chain was not fused for suspected compromise: it retired on a
+    fixed schedule. Refresh attempts are always refused; in-flight access
+    requests are accepted only until the wind-down window shown when the
+    rotation was announced closes. The new chain of the same device is
+    never affected by the late arrival of such a request.
+    """
+
+
+class ChainWoundDownError(TokenRevokedError):
+    """An in-flight request from a retired chain arrived after wind-down.
+
+    The pre-announced completion window for the old chain has closed, so
+    even an otherwise valid old access credential is now refused.
     """

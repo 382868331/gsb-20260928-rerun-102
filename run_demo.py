@@ -15,6 +15,8 @@ from authcore import (
     AccountDisabledError,
     AuthError,
     AuthService,
+    CredentialSupersededError,
+    DeviceFrozenError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
@@ -218,6 +220,114 @@ def main() -> None:
           [(d["device_id"], d["active"]) for d in svc.list_devices("赵远征")])
 
     section("8f. 导出设备活动记录（不含原始凭据）")
+    section("9. 设备凭据换代：计划换代与紧急冻结")
+
+    section("9a. 连续两次计划换代：旧链收尾、新链续期")
+    g1 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="watch-01", device_name="运动手表")
+    print(f"手表第 1 代登录身份: family={g1.family[:8]}… generation={g1.generation}")
+    r1 = svc.rollover_device("赵远征", "watch-01")
+    g2 = r1.bundle
+    print(f"第 1 次换代 -> generation={r1.generation}，"
+          f"已退休会话 {list(r1.superseded_sessions)}")
+    print("事先显示的换代规则:", r1.rule)
+    r2 = svc.rollover_device("赵远征", "watch-01", new_name="新运动手表")
+    g3 = r2.bundle
+    print(f"第 2 次换代 -> generation={r2.generation}")
+    expect("第 1 代旧续期请求（在途返回晚了）", svc.refresh, g1.refresh_token,
+           expected=CredentialSupersededError)
+    expect("第 2 代旧续期请求", svc.refresh, g2.refresh_token,
+           expected=CredentialSupersededError)
+    old_access = expect("第 1 代旧访问凭据仍在收尾范围内",
+                        svc.check_access_detail, g1.access_token)
+    print(f"  旧访问决定依据: {old_access['decision']} "
+          f"generation={old_access['generation']}")
+    expect("第 3 代当前链正常续期", svc.refresh, g3.refresh_token)
+
+    section("9b. 同设备并发：换代与旧续期请求抢锁")
+    w1 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="band-01", device_name="健康手环")
+    race_outcomes: list[tuple[str, object]] = []
+    barrier3 = threading.Barrier(3)
+
+    def old_request() -> None:
+        barrier3.wait()
+        try:
+            race_outcomes.append(("旧续期", svc.refresh(w1.refresh_token)))
+        except AuthError as exc:
+            race_outcomes.append(("旧续期", exc))
+
+    def do_rollover() -> None:
+        barrier3.wait()
+        try:
+            race_outcomes.append(("换代", svc.rollover_device(
+                "赵远征", "band-01")))
+        except AuthError as exc:
+            race_outcomes.append(("换代", exc))
+
+    t_old1 = threading.Thread(target=old_request)
+    t_old2 = threading.Thread(target=old_request)
+    t_roll = threading.Thread(target=do_rollover)
+    for t in (t_old1, t_old2, t_roll):
+        t.start()
+    for t in (t_old1, t_old2, t_roll):
+        t.join()
+    for label, outcome in race_outcomes:
+        print(f"  {label}: {type(outcome).__name__}")
+    band_new = next(o.bundle for label, o in race_outcomes if label == "换代")
+    expect("换代后的新链绝不会因旧请求晚到而被冻结",
+           svc.refresh, band_new.refresh_token)
+
+    section("9c. 旧请求乱序返回：先到新凭据、后到更老凭据")
+    expect("更老的旧续期最后才返回", svc.refresh, w1.refresh_token,
+           expected=CredentialSupersededError)
+    expect("新链访问仍然有效", svc.check_access, band_new.access_token)
+
+    section("9d. 怀疑泄露：紧急冻结撤销该设备全部未完成授权")
+    revoked_all = svc.freeze_device_compromised("赵远征", "watch-01")
+    print(f"紧急冻结手表，撤销历代链数: {revoked_all}（含换代收尾访问）")
+    expect("第 1 代收尾访问也被撤销", svc.check_access, g1.access_token,
+           expected=DeviceFrozenError)
+    expect("第 3 代续期被撤销", svc.refresh, g3.refresh_token,
+           expected=DeviceFrozenError)
+    expect("冻结期间禁止该设备重新登录",
+           lambda: svc.login("赵远征", "Quiet-Fox-904!",
+                             device_id="watch-01",
+                             device_name="新运动手表"),
+           expected=DeviceFrozenError)
+    print("其他设备不受牵连: 手环新链 ->",
+          svc.check_access(band_new.access_token))
+
+    section("9e. 解冻后重新登录：旧代不复活，继续向上编号")
+    svc.unfreeze_device("赵远征", "watch-01")
+    expect("解冻后第 3 代旧访问凭据仍撤销（冻结原由保留）",
+           svc.check_access, g3.access_token,
+           expected=TokenRevokedError)
+    g4 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="watch-01", device_name="新运动手表")
+    print(f"重新登录获得 generation={g4.generation}（旧代不复活）")
+
+    section("9f. 换代 / 重用告警 / 账户停用交错后的谱系")
+    svc.disable_user("赵远征")
+    svc.enable_user("赵远征")
+    lineage = svc.device_lineage("赵远征", "watch-01")
+    print(f"手表当前代际={lineage['current_generation']} "
+          f"冻结标记={lineage['frozen']}")
+    for gen in lineage["generations"]:
+        print(f"  gen={gen['generation']} session={gen['session_id']} "
+              f"superseded={gen['superseded']} revoked={gen['revoked']} "
+              f"原因={gen['revoke_reason']} "
+              f"收尾访问有效={gen['wind_down_access_valid']} "
+              f"续期链活跃={gen['refresh_chain_active']}")
+
+    section("9g. 保存重开后谱系仍可对应")
+    reopened = AuthService(str(DB), access_ttl=timedelta(seconds=2),
+                           refresh_ttl=timedelta(seconds=30))
+    persisted = reopened.device_lineage("赵远征", "watch-01")
+    print("重开后代际数:", len(persisted["generations"]),
+          "当前代:", persisted["current_generation"])
+
+    section("10. 导出设备活动记录（不含原始凭据）")
     export = svc.export_device_activity("赵远征")
     kinds = {}
     for event in export:
@@ -225,8 +335,11 @@ def main() -> None:
     print(f"共 {len(export)} 条记录，按类型统计: {kinds}")
     blob = repr(export)
     for secret in (phone.refresh_token, laptop.refresh_token,
-                   fresh.access_token):
+                   fresh.access_token, g1.refresh_token, g3.refresh_token):
         assert secret not in blob
+    rollover_records = [e for e in export if e["kind"] == "rollover"]
+    print(f"换代记录 {len(rollover_records)} 条，均只记设备/链关系与决定依据 "
+          "(generation / superseded_sessions / rule)，无原始凭据")
     print("导出内容只含哈希与元数据，无任何原始凭据")
 
     print("\n全部场景走完：过期 / 撤销 / 停用 / 格式错误均为独立错误类型，"

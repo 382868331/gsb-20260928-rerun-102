@@ -23,21 +23,36 @@
   那条链（错误信息注明 family / session / device），后来重新登录的
   会话不受影响。
 - 设备活动导出：`activity` 表区分 `login` / `refresh` / `revoke` /
-  `deny` 四类事件，只含哈希与元数据；设备重命名只改显示名，不改既有
-  审计记录中的设备归属快照。
+  `deny` / `rollover` 五类事件，只含哈希、设备与链的关系和决定依据；
+  设备重命名只改显示名，不改既有审计记录中的设备归属快照。
+- 受控设备凭据换代：`rollover_device` 执行**计划换代**，同一设备获得
+  新的登录链（新 family、generation 加一，活动归属不变）；旧代被标记
+  为 `superseded`——不能再创建新的续期（返回
+  `CredentialSupersededError`，这是事先返回给客户端的换代策略拒绝，不是
+  重放熔断），已经发出的访问凭据按 `WIND_DOWN_RULE` 在到期前继续有效。
+  在途旧请求无论早晚到达、乱序到达都只按换代规则决定，旧代请求永远不
+  会冻结新链。
+- 紧急冻结：`freeze_device_compromised` 用于怀疑泄露，撤销该设备**历代**
+  全部尚未完成的授权（含计划换代留下的收尾访问），并在解冻前禁止该设备
+  重新登录；其他设备不受牵连。`unfreeze_device` 只解除冻结标记，旧代不
+  复活，需重新登录或再次换代。`device_lineage` 可查看历代登录身份、
+  撤销/退休原因与仍有效范围（`wind_down_access_valid` /
+  `refresh_chain_active`），保存重开后仍然对应。
 
 ## 错误类型（不伪装成网络失败）
 
 `MalformedTokenError`（格式错误）、`InvalidTokenError`（未知凭据）、
 `TokenExpiredError`（过期）、`TokenRevokedError`（撤销）、
 `TokenReuseDetectedError`（续期凭据重用，家族熔断）、
+`CredentialSupersededError`（计划换代后旧代凭据的策略拒绝，不再续期、
+保留收尾访问）、`DeviceFrozenError`（设备紧急冻结）、
 `AccountDisabledError`（账户停用）、`InvalidCredentialsError`（用户名/口令
-错误），均继承自 `AuthError`。
+错误），均继承自 `AuthError`；前两者继承 `TokenRevokedError`。
 
 ## 使用
 
 ```bash
-python -m unittest discover -s tests   # 8 个测试
+python -m unittest discover -s tests   # 23 个测试
 python run_demo.py                      # 完整虚构用户演示
 
 python -m authcore.cli --db demo.json add-user alice 'S3cret!'
@@ -47,6 +62,10 @@ python -m authcore.cli --db demo.json refresh  rf_...
 python -m authcore.cli --db demo.json logout   at_...
 python -m authcore.cli --db demo.json devices  alice
 python -m authcore.cli --db demo.json freeze   alice phone-1
+python -m authcore.cli --db demo.json rollover alice phone-1 --name 新手机
+python -m authcore.cli --db demo.json freeze-compromised alice phone-1
+python -m authcore.cli --db demo.json unfreeze alice phone-1
+python -m authcore.cli --db demo.json lineage  alice phone-1
 python -m authcore.cli --db demo.json rename-device alice phone-1 新手机
 python -m authcore.cli --db demo.json disable  alice
 python -m authcore.cli --db demo.json enable   alice
@@ -61,6 +80,8 @@ python -m authcore.cli --db demo.json activity [alice]
 - `authcore/errors.py`：分类错误。
 - `authcore/cli.py`：命令行入口。
 - `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化、
-  多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计
-  归属等测试。
-- `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理场景。
+  多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计归属，
+  以及连续换代、换代/旧请求并发、旧请求乱序、紧急冻结、换代与停用交错、
+  重开后历代谱系对应等测试。
+- `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理与第 9 节
+  设备凭据换代场景。

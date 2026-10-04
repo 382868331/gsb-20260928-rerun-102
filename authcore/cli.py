@@ -8,6 +8,10 @@ Examples:
     python -m authcore.cli --db a.json logout   at_...
     python -m authcore.cli --db a.json devices  alice
     python -m authcore.cli --db a.json freeze   alice phone-1
+    python -m authcore.cli --db a.json rollover alice phone-1 [--name 新手机]
+    python -m authcore.cli --db a.json freeze-compromised alice phone-1
+    python -m authcore.cli --db a.json unfreeze alice phone-1
+    python -m authcore.cli --db a.json lineage  alice phone-1
     python -m authcore.cli --db a.json rename-device alice phone-1 新手机
     python -m authcore.cli --db a.json disable  alice
     python -m authcore.cli --db a.json enable   alice
@@ -43,6 +47,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("enable").add_argument("args", nargs=1)
     sub.add_parser("devices").add_argument("args", nargs=1)
     sub.add_parser("freeze").add_argument("args", nargs=2)
+    rollover_p = sub.add_parser("rollover")
+    rollover_p.add_argument("args", nargs=2)
+    rollover_p.add_argument("--name", default=None)
+    sub.add_parser("freeze-compromised").add_argument("args", nargs=2)
+    sub.add_parser("unfreeze").add_argument("args", nargs=2)
+    sub.add_parser("lineage").add_argument("args", nargs=2)
     sub.add_parser("rename-device").add_argument("args", nargs=3)
     sub.add_parser("events")
     sub.add_parser("activity").add_argument("args", nargs="?")
@@ -84,6 +94,30 @@ def main(argv: list[str] | None = None) -> int:
             frozen = svc.logout_device(args[0], args[1])
             print(json.dumps({"ok": True, "frozen_chains": frozen},
                              ensure_ascii=False))
+        elif ns.cmd == "rollover":
+            result = svc.rollover_device(args[0], args[1], new_name=ns.name)
+            print(json.dumps({
+                "ok": True,
+                "access_token": result.bundle.access_token,
+                "refresh_token": result.bundle.refresh_token,
+                "family": result.bundle.family,
+                "device_id": result.device_id,
+                "generation": result.generation,
+                "superseded_sessions": list(result.superseded_sessions),
+                "rule": result.rule,
+            }, ensure_ascii=False))
+        elif ns.cmd == "freeze-compromised":
+            revoked = svc.freeze_device_compromised(args[0], args[1])
+            print(json.dumps({"ok": True, "revoked_chains": revoked,
+                              "device_frozen": True}, ensure_ascii=False))
+        elif ns.cmd == "unfreeze":
+            svc.unfreeze_device(args[0], args[1])
+            print(json.dumps({"ok": True, "unfrozen": args[1],
+                              "old_generations_stay_revoked": True},
+                             ensure_ascii=False))
+        elif ns.cmd == "lineage":
+            print(json.dumps(svc.device_lineage(args[0], args[1]),
+                             ensure_ascii=False, indent=1))
         elif ns.cmd == "rename-device":
             svc.rename_device(args[0], args[1], args[2])
             print(json.dumps({"ok": True, "renamed": args[1]}, ensure_ascii=False))

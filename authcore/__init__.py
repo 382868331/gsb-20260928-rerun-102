@@ -1,6 +1,8 @@
 from .errors import (
     AccountDisabledError,
     AuthError,
+    CredentialSupersededError,
+    DeviceFrozenError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
@@ -20,5 +22,7 @@ __all__ = [
     "TokenExpiredError",
     "TokenRevokedError",
     "TokenReuseDetectedError",
+    "CredentialSupersededError",
+    "DeviceFrozenError",
     "AccountDisabledError",
 ]

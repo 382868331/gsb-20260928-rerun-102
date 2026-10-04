@@ -10,6 +10,8 @@ from authcore.service import hash_credential
 from authcore import (
     AccountDisabledError,
     AuthService,
+    CredentialSupersededError,
+    DeviceFrozenError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
@@ -287,6 +289,243 @@ class DeviceSessionTest(unittest.TestCase):
         self.assertTrue(all(not isinstance(o, BaseException) for o in outcomes))
         self.assertEqual({o.device_id for o in outcomes},
                          {"dev-0", "dev-1", "dev-2"})
+
+
+class DeviceRolloverTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "auth.db")
+        self.svc = AuthService(self.db, timedelta(seconds=20),
+                               timedelta(seconds=60))
+        self.svc.create_user("alice", "pw-alice")
+        self.svc.create_user("bob", "pw-bob")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def login(self, user, password, device_id, name=None):
+        return self.svc.login(user, password, device_id=device_id,
+                              device_name=name)
+
+    def test_planned_rollover_retires_old_chain_keeps_wind_down(self):
+        old = self.login("alice", "pw-alice", "phone-1", "手机")
+        result = self.svc.rollover_device("alice", "phone-1")
+        new = result.bundle
+        self.assertEqual(new.device_id, "phone-1")
+        self.assertEqual(new.generation, 2)
+        self.assertEqual(result.superseded_sessions, (old.session_id,))
+        self.assertNotEqual(old.family, new.family)
+        # Old refresh credential can never start a new rotation...
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(old.refresh_token)
+        # ...and arriving late a second time still gets the same policy
+        # decision, never a reuse circuit break that touches the new chain.
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(old.refresh_token)
+        # Already-issued old access token keeps working (wind-down scope).
+        detail = self.svc.check_access_detail(old.access_token)
+        self.assertEqual(detail["decision"], "wind_down")
+        self.assertEqual(detail["generation"], 1)
+        # The new chain is fully alive and can rotate normally.
+        rotated_new = self.svc.refresh(new.refresh_token)
+        self.assertEqual(self.svc.check_access(new.access_token), "alice")
+        self.assertEqual(self.svc.check_access(rotated_new.access_token),
+                         "alice")
+        self.assertEqual(rotated_new.generation, 2)
+
+    def test_successive_rollovers_form_lineage_and_current_only_refreshes(self):
+        gen1 = self.login("alice", "pw-alice", "phone-1", "手机")
+        gen2 = self.svc.rollover_device("alice", "phone-1").bundle
+        gen3 = self.svc.rollover_device("alice", "phone-1",
+                                        new_name="新手机").bundle
+        self.assertEqual((gen1.generation, gen2.generation, gen3.generation),
+                         (1, 2, 3))
+        for retired in (gen1, gen2):
+            with self.assertRaises(CredentialSupersededError):
+                self.svc.refresh(retired.refresh_token)
+        detail1 = self.svc.check_access_detail(gen1.access_token)
+        detail2 = self.svc.check_access_detail(gen2.access_token)
+        self.assertEqual(detail1["decision"], "wind_down")
+        self.assertEqual(detail2["decision"], "wind_down")
+        self.assertEqual(self.svc.check_access_detail(gen3.access_token)[
+                             "decision"], "active")
+        lineage = self.svc.device_lineage("alice", "phone-1")
+        self.assertEqual(lineage["device_name"], "新手机")
+        self.assertEqual(lineage["current_generation"], 3)
+        self.assertFalse(lineage["frozen"])
+        self.assertEqual([g["generation"] for g in lineage["generations"]],
+                         [1, 2, 3])
+        self.assertTrue(lineage["generations"][0]["wind_down_access_valid"])
+        self.assertTrue(lineage["generations"][2]["refresh_chain_active"])
+        self.assertIn("wind-down", lineage["rollover_rule"])
+
+    def test_concurrent_rollover_and_old_refresh_does_not_freeze_new_chain(self):
+        old = self.login("alice", "pw-alice", "phone-1", "手机")
+        outcomes = []
+        barrier = threading.Barrier(3)
+
+        def late_refresh():
+            barrier.wait()
+            try:
+                outcomes.append(("old", self.svc.refresh(old.refresh_token)))
+            except BaseException as exc:  # noqa: BLE001
+                outcomes.append(("old", exc))
+
+        def do_rollover():
+            barrier.wait()
+            try:
+                outcomes.append(("rollover",
+                                 self.svc.rollover_device("alice", "phone-1")))
+            except BaseException as exc:  # noqa: BLE001
+                outcomes.append(("rollover", exc))
+
+        threads = [threading.Thread(target=late_refresh),
+                   threading.Thread(target=late_refresh),
+                   threading.Thread(target=do_rollover)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        rollover = next(o for label, o in outcomes if label == "rollover")
+        self.assertNotIsInstance(rollover, BaseException)
+        old_results = [o for label, o in outcomes if label == "old"]
+        # Whether the old request landed before or after the rollover, exactly
+        # one outcome is possible: either a normal single-use rotation (it was
+        # the live chain at commit time), or the rollover policy rejection.
+        # Neither case leaves the new chain frozen.
+        self.assertTrue(all(
+            isinstance(o, CredentialSupersededError)
+            or not isinstance(o, BaseException)
+            for o in old_results
+        ))
+        if any(not isinstance(o, BaseException) for o in old_results):
+            # The refresh won the race: its result is the retired chain now;
+            # replaying it is still a policy rejection, and the new chain
+            # after rollover stays usable.
+            self.assertTrue(all(
+                isinstance(o, CredentialSupersededError)
+                or not isinstance(o, BaseException)
+                for o in old_results
+            ))
+        new_bundle = rollover.bundle
+        rotated = self.svc.refresh(new_bundle.refresh_token)
+        self.assertEqual(self.svc.check_access(rotated.access_token), "alice")
+
+    def test_out_of_order_old_requests_never_circuit_break(self):
+        gen1 = self.login("alice", "pw-alice", "phone-1", "手机")
+        mid = self.svc.refresh(gen1.refresh_token)
+        gen2 = self.svc.rollover_device("alice", "phone-1").bundle
+        # An even older credential returns later than a newer one.
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(mid.refresh_token)
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(gen1.refresh_token)
+        # New chain works regardless of the arrival order of old responses.
+        self.assertEqual(self.svc.check_access(gen2.access_token), "alice")
+        # No reuse-style family break: deny records carry the rollover basis.
+        denies = [
+            e for e in self.svc.export_device_activity("alice", "phone-1")
+            if e["kind"] == "deny"
+        ]
+        self.assertTrue(all(e["decision"] == "rollover_wind_down"
+                            for e in denies))
+
+    def test_emergency_freeze_revokes_all_generations_and_wind_down(self):
+        gen1 = self.login("alice", "pw-alice", "phone-1", "手机")
+        gen2 = self.svc.rollover_device("alice", "phone-1").bundle
+        revoked = self.svc.freeze_device_compromised("alice", "phone-1")
+        self.assertEqual(revoked, 2)
+        # Current chain, wind-down access, and further logins are all cut.
+        with self.assertRaises(DeviceFrozenError):
+            self.svc.check_access(gen1.access_token)
+        with self.assertRaises(DeviceFrozenError):
+            self.svc.check_access(gen2.access_token)
+        with self.assertRaises(DeviceFrozenError):
+            self.svc.refresh(gen2.refresh_token)
+        with self.assertRaises(DeviceFrozenError):
+            self.svc.login("alice", "pw-alice", device_id="phone-1",
+                           device_name="手机")
+        # Other devices are not implicated.
+        laptop = self.login("bob", "pw-bob", "laptop-1", "电脑")
+        alice_laptop = self.login("alice", "pw-alice", "laptop-2", "电脑")
+        self.assertEqual(self.svc.refresh(laptop.refresh_token).device_id,
+                         "laptop-1")
+        self.assertEqual(self.svc.check_access(alice_laptop.access_token),
+                         "alice")
+        # Unfreeze never resurrects old generations.
+        self.svc.unfreeze_device("alice", "phone-1")
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(gen2.refresh_token)
+        again = self.login("alice", "pw-alice", "phone-1", "新手机")
+        self.assertEqual(again.generation, 3)
+        self.assertEqual(self.svc.check_access(again.access_token), "alice")
+
+    def test_rollover_then_account_disable_then_enable_scopes_revocation(self):
+        phone = self.login("alice", "pw-alice", "phone-1", "手机")
+        new_phone = self.svc.rollover_device("alice", "phone-1").bundle
+        laptop = self.login("alice", "pw-alice", "laptop-1", "电脑")
+        bob_phone = self.login("bob", "pw-bob", "phone-1", "手机")
+        self.svc.disable_user("alice")
+        # Every generation, including wind-down access, ends on disable.
+        with self.assertRaises(AccountDisabledError):
+            self.svc.check_access(phone.access_token)
+        with self.assertRaises(AccountDisabledError):
+            self.svc.check_access(new_phone.access_token)
+        with self.assertRaises(AccountDisabledError):
+            self.svc.refresh(phone.refresh_token)
+        # Bob's identically named device is unaffected.
+        self.assertEqual(self.svc.check_access(bob_phone.access_token), "bob")
+        # Re-enable: old chains of every generation stay revoked.
+        self.svc.enable_user("alice")
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(phone.refresh_token)
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(new_phone.refresh_token)
+        lineage = self.svc.device_lineage("alice", "phone-1")
+        self.assertFalse(any(g["refresh_chain_active"]
+                             for g in lineage["generations"]))
+        self.assertFalse(any(g["wind_down_access_valid"]
+                             for g in lineage["generations"]))
+        relogin = self.login("alice", "pw-alice", device_id="phone-1")
+        self.assertEqual(relogin.generation, 3)
+
+    def test_reuse_alert_after_rollover_scoped_and_persisted(self):
+        gen1 = self.login("alice", "pw-alice", "phone-1", "手机")
+        rotated_gen1 = self.svc.refresh(gen1.refresh_token)
+        gen2 = self.svc.rollover_device("alice", "phone-1").bundle
+        # Replayed consumed credentials of the retired generation arrive late.
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(rotated_gen1.refresh_token)
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(gen1.refresh_token)
+        activity = self.svc.export_device_activity("alice", "phone-1")
+        rollover_events = [e for e in activity if e["kind"] == "rollover"]
+        self.assertEqual(len(rollover_events), 1)
+        self.assertEqual(rollover_events[0]["superseded_sessions"],
+                         [gen1.session_id])
+        self.assertIsNotNone(rollover_events[0]["rule"])
+        blob = repr(activity)
+        for secret in (gen1.refresh_token, gen2.refresh_token,
+                       rotated_gen1.access_token):
+            self.assertNotIn(secret, blob)
+
+        # Reopen the database: generations, reject reasons and surviving scope
+        # still line up under the same device.
+        restarted = AuthService(self.db, timedelta(seconds=20),
+                                timedelta(seconds=60))
+        lineage = restarted.device_lineage("alice", "phone-1")
+        gens = {g["generation"]: g for g in lineage["generations"]}
+        self.assertTrue(gens[1]["superseded"])
+        self.assertTrue(gens[1]["wind_down_access_valid"])
+        self.assertTrue(gens[2]["refresh_chain_active"])
+        self.assertEqual(lineage["current_generation"], 2)
+        self.assertEqual(restarted.check_access(gen1.access_token), "alice")
+        with self.assertRaises(CredentialSupersededError):
+            restarted.refresh(gen1.refresh_token)
+        events = restarted.export_device_activity("alice", "phone-1")
+        self.assertTrue(all("presented_hash" in e for e in events if e["kind"] == "deny"))
+        self.assertTrue(all(e.get("raw_credential") is None for e in events))
 
 
 if __name__ == "__main__":

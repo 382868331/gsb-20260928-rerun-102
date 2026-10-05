@@ -17,6 +17,10 @@ Examples:
     python -m authcore.cli --db a.json enable   alice
     python -m authcore.cli --db a.json events
     python -m authcore.cli --db a.json activity [alice]
+    python -m authcore.cli --db a.json plan-rollover alice dev1 dev2 --min-available 1 [--wind-down-deadline 2026-01-01T00:00:00+00:00]
+    python -m authcore.cli --db a.json plan plan_1
+    python -m authcore.cli --db a.json approve-batch plan_1 0
+    python -m authcore.cli --db a.json execute-batch plan_1 0
 
 Exit code 0 means allowed; non-zero means rejected. The error type (never a
 generic network failure) is printed to stderr.
@@ -56,6 +60,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("rename-device").add_argument("args", nargs=3)
     sub.add_parser("events")
     sub.add_parser("activity").add_argument("args", nargs="?")
+    plan_p = sub.add_parser("plan-rollover")
+    plan_p.add_argument("args", nargs="+")
+    plan_p.add_argument("--min-available", type=int, required=True)
+    plan_p.add_argument("--wind-down-deadline", default=None)
+    sub.add_parser("plan").add_argument("args", nargs=1)
+    sub.add_parser("approve-batch").add_argument("args", nargs=2)
+    sub.add_parser("execute-batch").add_argument("args", nargs=2)
     ns = parser.parse_args(argv)
 
     svc = AuthService(ns.db)
@@ -125,6 +136,22 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(svc.list_reuse_events(), ensure_ascii=False, indent=1))
         elif ns.cmd == "activity":
             print(json.dumps(svc.export_device_activity(args[0] if args else None),
+                             ensure_ascii=False, indent=1))
+        elif ns.cmd == "plan-rollover":
+            plan = svc.create_rollover_plan(
+                args[0], args[1:],
+                min_available=ns.min_available,
+                wind_down_deadline=ns.wind_down_deadline,
+            )
+            print(json.dumps(plan, ensure_ascii=False, indent=1))
+        elif ns.cmd == "plan":
+            print(json.dumps(svc.get_rollover_plan(args[0]),
+                             ensure_ascii=False, indent=1))
+        elif ns.cmd == "approve-batch":
+            print(json.dumps(svc.approve_rollover_batch(args[0], int(args[1])),
+                             ensure_ascii=False, indent=1))
+        elif ns.cmd == "execute-batch":
+            print(json.dumps(svc.execute_rollover_batch(args[0], int(args[1])),
                              ensure_ascii=False, indent=1))
     except AuthError as exc:
         print(json.dumps({"ok": False, "error": type(exc).__name__,

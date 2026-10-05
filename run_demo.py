@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import shutil
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from authcore import (
@@ -20,6 +20,7 @@ from authcore import (
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
+    RolloverPlanError,
     TokenExpiredError,
     TokenReuseDetectedError,
     TokenRevokedError,
@@ -341,6 +342,68 @@ def main() -> None:
     print(f"换代记录 {len(rollover_records)} 条，均只记设备/链关系与决定依据 "
           "(generation / superseded_sessions / rule)，无原始凭据")
     print("导出内容只含哈希与元数据，无任何原始凭据")
+
+    section("11. 多设备分阶段换代计划：模拟 -> 批准 -> 生效")
+    svc.enable_user("林小满")
+    fleet = {}
+    for dev in ("pos-01", "pos-02", "pos-03", "pos-04"):
+        fleet[dev] = svc.login("林小满", "Purple-Otter-721!",
+                               device_id=dev, device_name=dev)
+    plan = svc.create_rollover_plan(
+        "林小满", ["pos-01", "pos-02", "pos-03", "pos-04", "pos-01"],
+        min_available=2,
+        wind_down_deadline=(datetime.now(timezone.utc)
+                            + timedelta(hours=1)).isoformat(),
+    )
+    print(f"计划 {plan['id']}：去重后设备={plan['device_ids']} "
+          f"忽略重复提交={plan['duplicates_ignored']}")
+    print(f"模拟批次={[b['device_ids'] for b in plan['batches']]} "
+          f"收尾期限满足={plan['simulation']['wind_down_within_deadline']} "
+          f"缺口={plan['simulation']['availability_gap']}")
+    expect("未批准的批次不能生效", svc.execute_rollover_batch,
+           plan["id"], 0, expected=RolloverPlanError)
+
+    section("11a. 连续两批：批准且条件仍满足才生效")
+    svc.approve_rollover_batch(plan["id"], 0)
+    svc.approve_rollover_batch(plan["id"], 1)
+    first = svc.execute_rollover_batch(plan["id"], 0)
+    print("批次 0 结果:",
+          {r["device_id"]: r["outcome"]
+           for r in first["batch_result"]["results"]})
+    # 批次之间发生疑似泄露：紧急冻结优先，哪怕跌破最小可用数量。
+    svc.freeze_device_compromised("林小满", "pos-03")
+    svc.freeze_device_compromised("林小满", "pos-02")
+    svc.freeze_device_compromised("林小满", "pos-04")
+    second = svc.execute_rollover_batch(plan["id"], 1)
+    print("批次 1 结果:",
+          {r["device_id"]: (r["outcome"], r["reason"])
+           for r in second["batch_result"]["results"]})
+    print("可用数量缺口说明:", second["batch_result"]["availability_gap"])
+    expect("重复提交已执行批次被拒绝", svc.execute_rollover_batch,
+           plan["id"], 0, expected=RolloverPlanError)
+    detail = svc.check_access_detail(fleet["pos-01"].access_token)
+    print(f"pos-01 已发旧请求按所属代次收尾: decision={detail['decision']}")
+    expect("pos-03 被冻结后旧凭据立即阻断",
+           svc.check_access, fleet["pos-03"].access_token,
+           expected=DeviceFrozenError)
+
+    section("11b. 离线设备与账户停用交错")
+    svc.logout_device("林小满", "pos-04")
+    plan2 = svc.create_rollover_plan("林小满", ["pos-01", "pos-04"],
+                                     min_available=1)
+    print(f"计划 {plan2['id']} 模拟: "
+          f"{plan2['simulation']['device_status']}")
+    svc.approve_rollover_batch(plan2["id"], 0)
+    svc.disable_user("林小满")
+    expect("账户停用后已批准批次不能生效", svc.execute_rollover_batch,
+           plan2["id"], 0, expected=AccountDisabledError)
+    svc.enable_user("林小满")
+    result = svc.execute_rollover_batch(plan2["id"], 0)
+    print("重开后执行: 会话已撤销的设备按离线跳过，不补发授权 ->",
+          {r["device_id"]: r["outcome"]
+           for r in result["batch_result"]["results"]})
+    print("没有任何设备为了凑数被自动冻结；缺口:",
+          result["batch_result"]["availability_gap"])
 
     print("\n全部场景走完：过期 / 撤销 / 停用 / 格式错误均为独立错误类型，"
           "没有伪装成网络失败。")

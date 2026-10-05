@@ -38,6 +38,17 @@
   复活，需重新登录或再次换代。`device_lineage` 可查看历代登录身份、
   撤销/退休原因与仍有效范围（`wind_down_access_valid` /
   `refresh_chain_active`），保存重开后仍然对应。
+- 多设备分阶段换代计划：`create_rollover_plan` 由管理员为设备集合声明
+  必须保持可用的最小数量与旧请求收尾期限，系统只**模拟**换代顺序并按
+  "整批失败也不跌破最小可用数量"划分批次（含逐设备 ready / offline /
+  frozen 状态与收尾期限是否满足的投影），不改变任何凭据；
+  `approve_rollover_batch` 显式批准后，`execute_rollover_batch` 在执行
+  时逐设备重新校验条件才生效。某设备换代失败只记入批次结果，其余设备
+  **不会**为了凑数被自动冻结；疑似泄露的紧急冻结优先阻断该设备，即使
+  因此跌破最小可用数量，也会在结果与 `get_rollover_plan` 的
+  `current_availability.gap` 中说明缺口。已发出的旧请求仍按所属代次
+  与当时收尾规则处理，不受其他设备新代次牵连。同一设备重复提交会被
+  去重，已执行批次重复执行被拒绝。
 
 ## 错误类型（不伪装成网络失败）
 
@@ -46,13 +57,14 @@
 `TokenReuseDetectedError`（续期凭据重用，家族熔断）、
 `CredentialSupersededError`（计划换代后旧代凭据的策略拒绝，不再续期、
 保留收尾访问）、`DeviceFrozenError`（设备紧急冻结）、
+`RolloverPlanError`（分阶段换代计划未批准/重复提交/约束不成立）、
 `AccountDisabledError`（账户停用）、`InvalidCredentialsError`（用户名/口令
 错误），均继承自 `AuthError`；前两者继承 `TokenRevokedError`。
 
 ## 使用
 
 ```bash
-python -m unittest discover -s tests   # 23 个测试
+python -m unittest discover -s tests   # 30 个测试
 python run_demo.py                      # 完整虚构用户演示
 
 python -m authcore.cli --db demo.json add-user alice 'S3cret!'
@@ -71,6 +83,10 @@ python -m authcore.cli --db demo.json disable  alice
 python -m authcore.cli --db demo.json enable   alice
 python -m authcore.cli --db demo.json events
 python -m authcore.cli --db demo.json activity [alice]
+python -m authcore.cli --db demo.json plan-rollover alice phone-1 pad-1 --min-available 1
+python -m authcore.cli --db demo.json plan plan_1
+python -m authcore.cli --db demo.json approve-batch plan_1 0
+python -m authcore.cli --db demo.json execute-batch plan_1 0
 ```
 
 ## 文件
@@ -82,6 +98,7 @@ python -m authcore.cli --db demo.json activity [alice]
 - `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化、
   多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计归属，
   以及连续换代、换代/旧请求并发、旧请求乱序、紧急冻结、换代与停用交错、
-  重开后历代谱系对应等测试。
+  重开后历代谱系对应，以及分阶段计划的连续两批、同设备重复提交、离线
+  设备、紧急冻结缺口、账户停用交错、旧请求代次归属、收尾期限投影等测试。
 - `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理与第 9 节
-  设备凭据换代场景。
+  设备凭据换代、第 11 节多设备分阶段换代计划场景。

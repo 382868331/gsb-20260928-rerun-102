@@ -54,3 +54,14 @@ class DeviceFrozenError(TokenRevokedError):
     All outstanding authorization of the device is revoked, including the
     wind-down access tokens a planned rollover had left valid.
     """
+
+
+class RolloverPlanError(AuthError):
+    """A staged multi-device rollover plan cannot proceed as requested.
+
+    Raised for unknown plans/batches, batches that were not explicitly
+    approved, batches that were already executed, and plans whose declared
+    constraints (e.g. minimum available devices) are impossible by
+    construction. A per-device failure inside a batch is *not* this error:
+    it is recorded in the batch result and never freezes other devices.
+    """

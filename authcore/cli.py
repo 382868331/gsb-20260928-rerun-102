@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import timedelta
 
 from .errors import AuthError
 from .service import AuthService
@@ -50,6 +51,22 @@ def main(argv: list[str] | None = None) -> int:
     rollover_p = sub.add_parser("rollover")
     rollover_p.add_argument("args", nargs=2)
     rollover_p.add_argument("--name", default=None)
+    plan_p = sub.add_parser("plan-rollover")
+    plan_p.add_argument("args", nargs=2)
+    plan_p.add_argument("--batch", action="append", required=True,
+                        help="comma-separated device ids; repeat for batches")
+    plan_p.add_argument("--wind-down-seconds", type=int, default=None)
+    approve_p = sub.add_parser("approve-rollover")
+    approve_p.add_argument("args", nargs="+")
+    execute_p = sub.add_parser("execute-rollover")
+    execute_p.add_argument("args", nargs=2)
+    get_plan_p = sub.add_parser("rollover-plan")
+    get_plan_p.add_argument("args", nargs=1)
+    freeze_report_p = sub.add_parser("freeze-compromised-report")
+    freeze_report_p.add_argument("args", nargs=2)
+    freeze_report_p.add_argument("--managed-devices",
+                                 help="comma-separated device ids")
+    freeze_report_p.add_argument("--minimum-available", type=int, default=0)
     sub.add_parser("freeze-compromised").add_argument("args", nargs=2)
     sub.add_parser("unfreeze").add_argument("args", nargs=2)
     sub.add_parser("lineage").add_argument("args", nargs=2)
@@ -104,8 +121,37 @@ def main(argv: list[str] | None = None) -> int:
                 "device_id": result.device_id,
                 "generation": result.generation,
                 "superseded_sessions": list(result.superseded_sessions),
-                "rule": result.rule,
-            }, ensure_ascii=False))
+                             "rule": result.rule,
+                            }, ensure_ascii=False))
+        elif ns.cmd == "plan-rollover":
+            batches = [batch.split(",") for batch in ns.batch]
+            wind_down = (
+                None if ns.wind_down_seconds is None
+                else timedelta(seconds=ns.wind_down_seconds)
+            )
+            print(json.dumps(svc.plan_device_rollover(
+                args[0], batches, int(args[1]), wind_down=wind_down
+            ), ensure_ascii=False, indent=1))
+        elif ns.cmd == "approve-rollover":
+            print(json.dumps(svc.approve_rollover_batches(
+                args[0], [int(v) for v in args[1:]]
+            ), ensure_ascii=False, indent=1))
+        elif ns.cmd == "execute-rollover":
+            print(json.dumps(svc.execute_rollover_batch(
+                args[0], int(args[1])
+            ), ensure_ascii=False, indent=1))
+        elif ns.cmd == "rollover-plan":
+            print(json.dumps(svc.get_rollover_plan(args[0]),
+                             ensure_ascii=False, indent=1))
+        elif ns.cmd == "freeze-compromised-report":
+            managed = (
+                None if ns.managed_devices is None
+                else ns.managed_devices.split(",")
+            )
+            print(json.dumps(svc.freeze_device_compromised_report(
+                args[0], args[1], managed_device_ids=managed,
+                minimum_available=ns.minimum_available,
+            ), ensure_ascii=False, indent=1))
         elif ns.cmd == "freeze-compromised":
             revoked = svc.freeze_device_compromised(args[0], args[1])
             print(json.dumps({"ok": True, "revoked_chains": revoked,

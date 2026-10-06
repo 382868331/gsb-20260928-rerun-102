@@ -9,11 +9,14 @@ from datetime import datetime, timedelta, timezone
 
 from .errors import (
     AccountDisabledError,
+    AuthError,
     CredentialSupersededError,
+    DeviceOfflineError,
     DeviceFrozenError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
+    PlanNotApprovedError,
     TokenExpiredError,
     TokenReuseDetectedError,
     TokenRevokedError,
@@ -65,6 +68,18 @@ WIND_DOWN_RULE = (
     "refresh rotations; access tokens already issued stay usable until they "
     "expire or the device is frozen/the account is disabled"
 )
+
+
+def _wind_down_rule(deadline: datetime | None) -> str:
+    if deadline is None:
+        return WIND_DOWN_RULE
+    return (
+        "planned rollover wind-down until "
+        f"{deadline.astimezone(timezone.utc).isoformat()}: retired "
+        "generations can no longer create refresh rotations; access tokens "
+        "already issued stay usable until their own expiry or that deadline, "
+        "unless the device is frozen or the account is disabled"
+    )
 
 
 class AuthService:
@@ -232,7 +247,11 @@ class AuthService:
     # ---- controlled credential rollover ---------------------------------
 
     def rollover_device(
-        self, username: str, device_id: str, new_name: str | None = None
+        self,
+        username: str,
+        device_id: str,
+        new_name: str | None = None,
+        wind_down: timedelta | None = None,
     ) -> RolloverResult:
         """Planned credential rollover for one device.
 
@@ -245,67 +264,262 @@ class AuthService:
         already issued remain usable until they expire. Emergency freeze or
         account disable can still cut that wind-down short.
         """
+        if wind_down is not None and wind_down <= timedelta(0):
+            raise ValueError("wind_down must be positive")
+        with self.store.transaction() as data:
+            return self._rollover_device_locked(
+                data, username, device_id, new_name=new_name,
+                wind_down=wind_down,
+            )
+
+    def plan_device_rollover(
+        self,
+        username: str,
+        batches: list[list[str]],
+        minimum_available: int,
+        wind_down: timedelta | None = None,
+    ) -> dict:
+        """Simulate staged device rollovers without issuing credentials."""
+        if minimum_available < 0:
+            raise ValueError("minimum_available must be non-negative")
+        if not batches or any(not batch for batch in batches):
+            raise ValueError("batches must contain at least one device each")
+        if wind_down is not None and wind_down <= timedelta(0):
+            raise ValueError("wind_down must be positive")
         with self.store.transaction() as data:
             user = data["users"].get(username)
             if user is None:
                 raise InvalidCredentialsError("unknown user")
-            if user["disabled"]:
-                raise AccountDisabledError("account is disabled")
-            device = user.setdefault("devices", {}).get(device_id)
-            if device is None:
-                raise InvalidTokenError("unknown device for this user")
-            device.setdefault("generation", 0)
-            device.setdefault("frozen", False)
-            if device.get("frozen"):
-                raise DeviceFrozenError(
-                    f"device {device_id} is frozen; unfreeze it before a "
-                    "planned rollover"
+            devices = user.setdefault("devices", {})
+            all_devices = [d for batch in batches for d in batch]
+            if len(all_devices) != len(set(all_devices)):
+                raise ValueError("a device may only appear once in a plan")
+            unknown = sorted(set(all_devices) - set(devices))
+            if unknown:
+                raise InvalidTokenError(
+                    "unknown device(s) for this user: " + ", ".join(unknown)
                 )
-            if new_name is not None:
-                device["name"] = new_name
             now = _now()
-            old_sessions: list[int] = []
-            for session in data["sessions"].values():
-                if (
-                    session["username"] == username
-                    and session.get("device_id") == device_id
-                    and not session["revoked"]
-                ):
-                    old_sessions.append(session["id"])
-                    session["superseded"] = True
-                    session["superseded_at"] = now.isoformat()
-                    session.setdefault("generation", 1)
-                    for rf in data["refresh"].values():
-                        if (
-                            rf["session_id"] == session["id"]
-                            and not rf["used"]
-                        ):
-                            rf["superseded"] = True
-            old_generation = device["generation"]
-            new_generation = max(device["generation"], 0) + 1
-            device["generation"] = new_generation
-            bundle = self._issue_bundle(
-                data, username, device_id, generation=new_generation
+            target_ids = set(all_devices)
+            wind_down_seconds = (
+                None if wind_down is None else wind_down.total_seconds()
             )
-            session = data["sessions"][str(bundle.session_id)]
-            self._record(
-                data, "rollover", session,
-                detail=(
-                    f"planned rollover generation {old_generation} -> "
-                    f"{new_generation}; {len(old_sessions)} prior chain(s) "
-                    "retired; " + WIND_DOWN_RULE
-                ),
-                generation=new_generation,
-                superseded_sessions=list(old_sessions),
-                rule=WIND_DOWN_RULE,
+            initial = self._available_device_ids(data, username, target_ids, now)
+            available = set(initial)
+            blocked: set[str] = set()
+            simulated_batches = []
+            for batch_index, batch in enumerate(batches):
+                rows = []
+                after = set(available)
+                for device_id in batch:
+                    device = devices[device_id]
+                    active = self._rollable_sessions_for_device(
+                        data, username, device_id, now
+                    )
+                    reason = None
+                    if user.get("disabled"):
+                        reason = "account disabled"
+                    elif device.get("frozen"):
+                        reason = "device frozen after suspected compromise"
+                    elif not active:
+                        reason = "device offline: no active credential chain"
+                    eligible = reason is None
+                    if eligible:
+                        after.add(device_id)
+                    else:
+                        after.discard(device_id)
+                        blocked.add(device_id)
+                    rows.append({
+                        "device_id": device_id,
+                        "eligible": eligible,
+                        "reason": reason,
+                        "current_generation": device.get("generation", 0),
+                        "active_sessions": [s["id"] for s in active],
+                        "new_generation": (
+                            device.get("generation", 0) + 1
+                            if eligible else None
+                        ),
+                    })
+                simulated_batches.append({
+                    "batch_index": batch_index,
+                    "devices": rows,
+                    "projected_available_after": sorted(after),
+                    "projected_available_count": len(after),
+                    "meets_minimum": len(after) >= minimum_available,
+                })
+                available = after
+            plan_id = "plan_" + secrets.token_hex(12)
+            plan = {
+                "id": plan_id,
+                "username": username,
+                "batches": [list(batch) for batch in batches],
+                "minimum_available": minimum_available,
+                "wind_down_seconds": wind_down_seconds,
+                "created_at": now.isoformat(),
+                "approved_batches": [],
+                "executed_devices": [],
+                "results": [],
+                "status": "simulated",
+                "simulation": {
+                    "initial_meets_minimum": len(initial) >= minimum_available,
+                    "feasible": (
+                        len(initial) >= minimum_available
+                        and all(
+                        b["projected_available_count"] >= minimum_available
+                        for b in simulated_batches
+                        )
+                    ),
+                    "initial_available": sorted(initial),
+                    "initial_available_count": len(initial),
+                    "blocked_devices": sorted(blocked),
+                    "batches": simulated_batches,
+                },
+            }
+            data.setdefault("rollover_plans", {})[plan_id] = plan
+            return self._public_plan(plan)
+
+    def approve_rollover_batches(self, plan_id: str, batch_indexes: list[int]) -> dict:
+        with self.store.transaction() as data:
+            plan = data.get("rollover_plans", {}).get(plan_id)
+            if plan is None:
+                raise InvalidTokenError("unknown rollover plan")
+            valid = set(range(len(plan["batches"])))
+            requested = set(batch_indexes)
+            invalid = sorted(requested - valid)
+            if invalid:
+                raise ValueError("unknown batch index(es): " + repr(invalid))
+            plan["approved_batches"] = sorted(
+                set(plan.get("approved_batches", [])) | requested
             )
-            return RolloverResult(
-                bundle=bundle,
-                device_id=device_id,
-                generation=new_generation,
-                superseded_sessions=tuple(old_sessions),
-                rule=WIND_DOWN_RULE,
+            plan["approval_status"] = "explicit_batch_approval"
+            return self._public_plan(plan)
+
+    def execute_rollover_batch(self, plan_id: str, batch_index: int) -> dict:
+        with self.store.transaction() as data:
+            plan = data.get("rollover_plans", {}).get(plan_id)
+            if plan is None:
+                raise InvalidTokenError("unknown rollover plan")
+            if batch_index not in range(len(plan["batches"])):
+                raise ValueError("unknown batch index")
+            if batch_index not in plan.get("approved_batches", []):
+                raise PlanNotApprovedError(
+                    f"batch {batch_index} has not been explicitly approved"
+                )
+            username = plan["username"]
+            device_ids = list(plan["batches"][batch_index])
+            minimum = plan["minimum_available"]
+            wind_down = (
+                None if plan.get("wind_down_seconds") is None
+                else timedelta(seconds=plan["wind_down_seconds"])
             )
+            target_ids = {d for batch in plan["batches"] for d in batch}
+            before = self._available_device_ids(
+                data, username, target_ids, _now()
+            )
+            rows = []
+            executed: set[str] = set()
+            for device_id in device_ids:
+                if device_id in plan.get("executed_devices", []):
+                    rows.append({
+                        "device_id": device_id,
+                        "status": "skipped",
+                        "generation": None,
+                        "superseded_sessions": [],
+                        "rule": None,
+                        "reason": "device already rolled over in this plan",
+                    })
+                    continue
+                try:
+                    result = self._rollover_device_locked(
+                        data, username, device_id, wind_down=wind_down
+                    )
+                    executed.add(device_id)
+                    rows.append({
+                        "device_id": device_id,
+                        "status": "rolled_over",
+                        "generation": result.generation,
+                        "superseded_sessions": list(result.superseded_sessions),
+                        "rule": result.rule,
+                        "reason": None,
+                        "access_token": result.bundle.access_token,
+                        "refresh_token": result.bundle.refresh_token,
+                    })
+                except AuthError as exc:
+                    rows.append({
+                        "device_id": device_id,
+                        "status": "failed",
+                        "generation": None,
+                        "superseded_sessions": [],
+                        "rule": None,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    })
+            after = self._available_device_ids(
+                data, username, target_ids, _now()
+            )
+            plan.setdefault("executed_devices", []).extend(sorted(executed))
+            batch_result = {
+                "observed_at": _now().isoformat(),
+                "batch_index": batch_index,
+                "before_available": sorted(before),
+                "after_available": sorted(after),
+                "minimum_available": minimum,
+                "shortfall": max(0, minimum - len(after)),
+                "availability_gap": sorted(target_ids - after),
+                "results": [
+                    {k: v for k, v in row.items()
+                     if k not in {"access_token", "refresh_token"}}
+                    for row in rows
+                ],
+            }
+            plan.setdefault("results", []).append(batch_result)
+            plan["status"] = (
+                "executed"
+                if set(plan.get("executed_devices", [])) == target_ids
+                else "partially_executed"
+            )
+            return {
+                "plan_id": plan_id,
+                "batch_index": batch_index,
+                **{k: v for k, v in batch_result.items() if k != "results"},
+                "results": rows,
+            }
+
+    def get_rollover_plan(self, plan_id: str) -> dict:
+        with self.store.connect() as data:
+            plan = data.get("rollover_plans", {}).get(plan_id)
+            if plan is None:
+                raise InvalidTokenError("unknown rollover plan")
+            return self._public_plan(plan)
+
+    def freeze_device_compromised_report(
+        self,
+        username: str,
+        device_id: str,
+        managed_device_ids: list[str] | None = None,
+        minimum_available: int = 0,
+    ) -> dict:
+        revoked = self.freeze_device_compromised(username, device_id)
+        with self.store.connect() as data:
+            user_devices = data["users"].get(username, {}).get("devices", {})
+            target_ids = (
+                set(managed_device_ids)
+                if managed_device_ids is not None
+                else set(user_devices)
+            )
+            target_ids.add(device_id)
+            available = self._available_device_ids(
+                data, username, target_ids, _now()
+            )
+            return {
+                "device_id": device_id,
+                "revoked_chains": revoked,
+                "device_frozen": True,
+                "available_devices": sorted(available),
+                "available_count": len(available),
+                "minimum_available": minimum_available,
+                "shortfall": max(0, minimum_available - len(available)),
+                "availability_gap": sorted(target_ids - available),
+            }
 
     def freeze_device_compromised(
         self, username: str, device_id: str
@@ -393,6 +607,12 @@ class AuthService:
                     wind_down = any(
                         not at["revoked"]
                         and now < datetime.fromisoformat(at["expires_at"])
+                        and (
+                            session.get("wind_down_until") is None
+                            or now < datetime.fromisoformat(
+                                session["wind_down_until"]
+                            )
+                        )
                         for at in data["access"].values()
                         if at["session_id"] == session["id"]
                     )
@@ -494,13 +714,23 @@ class AuthService:
                 raise TokenRevokedError("credential or session revoked")
             if _now() >= datetime.fromisoformat(at["expires_at"]):
                 raise TokenExpiredError("access token expired")
+            deadline = session.get("wind_down_until")
+            if (
+                session.get("superseded")
+                and deadline is not None
+                and _now() >= datetime.fromisoformat(deadline)
+            ):
+                raise CredentialSupersededError(
+                    "retired generation passed its planned wind-down deadline"
+                )
             decision = "wind_down" if session.get("superseded") else "active"
             return {
                 "username": session["username"],
                 "device_id": session.get("device_id"),
                 "generation": session.get("generation", 1),
                 "decision": decision,
-                "rule": WIND_DOWN_RULE if decision == "wind_down" else None,
+                "rule": session.get("wind_down_rule", WIND_DOWN_RULE)
+                if decision == "wind_down" else None,
             }
 
     # ---- refresh rotation -----------------------------------------------
@@ -674,6 +904,175 @@ class AuthService:
             if family is not None:
                 events = [e for e in events if e["family"] == family]
             return [dict(e) for e in events]
+
+    # ---- rollover helpers -----------------------------------------------
+
+    @staticmethod
+    def _active_sessions_for_device(
+        data: dict, username: str, device_id: str
+    ) -> list[dict]:
+        return [
+            session
+            for session in data["sessions"].values()
+            if (
+                session["username"] == username
+                and session.get("device_id") == device_id
+                and not session["revoked"]
+            )
+        ]
+
+    def _rollable_sessions_for_device(
+        self,
+        data: dict,
+        username: str,
+        device_id: str,
+        now: datetime,
+    ) -> list[dict]:
+        sessions = []
+        for session in self._active_sessions_for_device(data, username, device_id):
+            has_live_refresh = any(
+                not rf.get("revoked")
+                and not rf.get("used")
+                and not rf.get("superseded")
+                and now < datetime.fromisoformat(rf["expires_at"])
+                for rf in data["refresh"].values()
+                if rf["session_id"] == session["id"]
+            )
+            if has_live_refresh:
+                sessions.append(session)
+        return sessions
+
+    def _available_device_ids(
+        self,
+        data: dict,
+        username: str,
+        device_ids: set[str],
+        now: datetime,
+    ) -> set[str]:
+        user = data["users"].get(username)
+        if user is None or user.get("disabled"):
+            return set()
+        available = set()
+        devices = user.get("devices", {})
+        for device_id in device_ids:
+            device = devices.get(device_id)
+            if device is None or device.get("frozen"):
+                continue
+            for session in self._active_sessions_for_device(
+                data, username, device_id
+            ):
+                deadline = session.get("wind_down_until")
+                if (
+                    session.get("superseded")
+                    and deadline is not None
+                    and now >= datetime.fromisoformat(deadline)
+                ):
+                    continue
+                has_live_access = any(
+                    not at["revoked"]
+                    and now < datetime.fromisoformat(at["expires_at"])
+                    and (
+                        deadline is None
+                        or not session.get("superseded")
+                        or now < datetime.fromisoformat(deadline)
+                    )
+                    for at in data["access"].values()
+                    if at["session_id"] == session["id"]
+                )
+                has_live_refresh = any(
+                    not rf.get("revoked")
+                    and not rf.get("used")
+                    and not rf.get("superseded")
+                    and now < datetime.fromisoformat(rf["expires_at"])
+                    for rf in data["refresh"].values()
+                    if rf["session_id"] == session["id"]
+                )
+                if has_live_access or has_live_refresh:
+                    available.add(device_id)
+                    break
+        return available
+
+    @staticmethod
+    def _public_plan(plan: dict) -> dict:
+        return {
+            key: value
+            for key, value in plan.items()
+            if key not in {"results"}
+        }
+
+    def _rollover_device_locked(
+        self,
+        data: dict,
+        username: str,
+        device_id: str,
+        new_name: str | None = None,
+        wind_down: timedelta | None = None,
+    ) -> RolloverResult:
+        user = data["users"].get(username)
+        if user is None:
+            raise InvalidCredentialsError("unknown user")
+        if user["disabled"]:
+            raise AccountDisabledError("account is disabled")
+        device = user.setdefault("devices", {}).get(device_id)
+        if device is None:
+            raise InvalidTokenError("unknown device for this user")
+        device.setdefault("generation", 0)
+        device.setdefault("frozen", False)
+        if device.get("frozen"):
+            raise DeviceFrozenError(
+                f"device {device_id} is frozen; unfreeze it before a "
+                "planned rollover"
+            )
+        now = _now()
+        rollable_sessions = self._rollable_sessions_for_device(
+            data, username, device_id, now
+        )
+        if not rollable_sessions:
+            raise DeviceOfflineError(
+                f"device {device_id} is offline and has no active "
+                "credential chain to roll over"
+            )
+        if new_name is not None:
+            device["name"] = new_name
+        deadline = None if wind_down is None else now + wind_down
+        rule = _wind_down_rule(deadline)
+        old_sessions: list[int] = []
+        for session in rollable_sessions:
+            old_sessions.append(session["id"])
+            session["superseded"] = True
+            session["superseded_at"] = now.isoformat()
+            if deadline is not None:
+                session["wind_down_until"] = deadline.isoformat()
+            session["wind_down_rule"] = rule
+            session.setdefault("generation", 1)
+            for rf in data["refresh"].values():
+                if rf["session_id"] == session["id"] and not rf["used"]:
+                    rf["superseded"] = True
+        old_generation = device["generation"]
+        new_generation = max(device["generation"], 0) + 1
+        device["generation"] = new_generation
+        bundle = self._issue_bundle(
+            data, username, device_id, generation=new_generation
+        )
+        session = data["sessions"][str(bundle.session_id)]
+        self._record(
+            data, "rollover", session,
+            detail=(
+                f"planned rollover generation {old_generation} -> "
+                f"{new_generation}; {len(old_sessions)} prior chain(s) "
+                "retired; " + rule
+            ),
+            generation=new_generation,
+            superseded_sessions=list(old_sessions),
+            rule=rule,
+        )
+        return RolloverResult(
+            bundle=bundle,
+            device_id=device_id,
+            generation=new_generation,
+            superseded_sessions=tuple(old_sessions),
+            rule=rule,
+        )
 
     def export_device_activity(
         self, username: str | None = None, device_id: str | None = None

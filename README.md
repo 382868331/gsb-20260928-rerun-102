@@ -38,6 +38,13 @@
   复活，需重新登录或再次换代。`device_lineage` 可查看历代登录身份、
   撤销/退休原因与仍有效范围（`wind_down_access_valid` /
   `refresh_chain_active`），保存重开后仍然对应。
+- 多设备分阶段换代：管理员声明设备批次、必须保持可用的最小数量，以及每代旧请求的
+  收尾期限。`plan_device_rollover` 只模拟换代顺序和每批后的可用设备，不签发凭据；
+  `approve_rollover_batches` 记录明确批准，`execute_rollover_batch` 执行时重新校验
+  账户、冻结、离线和当前代际。单台失败只影响该设备，系统不会为了凑够计划数量而冻结
+  其他设备；怀疑泄露时优先冻结对应设备，并在结果中列出 `shortfall` 与
+  `availability_gap`。旧访问请求只使用自己所属代次在换代时保存的收尾规则，不被其他
+  设备的新代次牵连。
 
 ## 错误类型（不伪装成网络失败）
 
@@ -45,14 +52,16 @@
 `TokenExpiredError`（过期）、`TokenRevokedError`（撤销）、
 `TokenReuseDetectedError`（续期凭据重用，家族熔断）、
 `CredentialSupersededError`（计划换代后旧代凭据的策略拒绝，不再续期、
-保留收尾访问）、`DeviceFrozenError`（设备紧急冻结）、
+保留收尾访问或已过收尾截止）、`DeviceFrozenError`（设备紧急冻结）、
+`DeviceOfflineError`（设备没有可换代的当前链）、
+`PlanNotApprovedError`（批次未获明确批准）、
 `AccountDisabledError`（账户停用）、`InvalidCredentialsError`（用户名/口令
 错误），均继承自 `AuthError`；前两者继承 `TokenRevokedError`。
 
 ## 使用
 
 ```bash
-python -m unittest discover -s tests   # 23 个测试
+python -m unittest discover -s tests   # 29 个测试
 python run_demo.py                      # 完整虚构用户演示
 
 python -m authcore.cli --db demo.json add-user alice 'S3cret!'
@@ -63,6 +72,11 @@ python -m authcore.cli --db demo.json logout   at_...
 python -m authcore.cli --db demo.json devices  alice
 python -m authcore.cli --db demo.json freeze   alice phone-1
 python -m authcore.cli --db demo.json rollover alice phone-1 --name 新手机
+python -m authcore.cli --db demo.json plan-rollover alice 1 --batch phone-1,tablet-1 --batch laptop-1 --wind-down-seconds 300
+python -m authcore.cli --db demo.json approve-rollover plan_... 0
+python -m authcore.cli --db demo.json execute-rollover plan_... 0
+python -m authcore.cli --db demo.json rollover-plan plan_...
+python -m authcore.cli --db demo.json freeze-compromised-report alice phone-1 --managed-devices phone-1,tablet-1,laptop-1 --minimum-available 2
 python -m authcore.cli --db demo.json freeze-compromised alice phone-1
 python -m authcore.cli --db demo.json unfreeze alice phone-1
 python -m authcore.cli --db demo.json lineage  alice phone-1
@@ -82,6 +96,7 @@ python -m authcore.cli --db demo.json activity [alice]
 - `tests/test_authcore.py`：含 4 线程并发续期、重放熔断、重启持久化、
   多设备并发续期、单设备冻结、交错重放定位、停用/重开、重命名审计归属，
   以及连续换代、换代/旧请求并发、旧请求乱序、紧急冻结、换代与停用交错、
-  重开后历代谱系对应等测试。
+  连续两批计划、同批重复提交、离线设备、停用交错、紧急冻结缺口、逐代次
+  收尾期限、重开后历代谱系对应等测试。
 - `run_demo.py`：虚构用户全流程演示（中文输出），含多设备管理与第 9 节
   设备凭据换代场景。

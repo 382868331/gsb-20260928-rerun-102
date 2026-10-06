@@ -31,6 +31,7 @@ class Store:
                     "refresh": {},
                     "reuse": [],
                     "activity": [],
+                    "rollover_plans": {},
                     "seq": 0,
                 }
             )
@@ -39,6 +40,7 @@ class Store:
         with open(self.path, encoding="utf-8") as f:
             data = json.load(f)
         data.setdefault("activity", [])
+        data.setdefault("rollover_plans", {})
         return data
 
     def _write(self, data: dict) -> None:

@@ -20,6 +20,7 @@ from authcore import (
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
+    PlanNotApprovedError,
     TokenExpiredError,
     TokenReuseDetectedError,
     TokenRevokedError,
@@ -326,6 +327,57 @@ def main() -> None:
     persisted = reopened.device_lineage("赵远征", "watch-01")
     print("重开后代际数:", len(persisted["generations"]),
           "当前代:", persisted["current_generation"])
+
+    section("9h. 多设备分阶段换代：模拟、显式批准、重新校验")
+    p1 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="plan-phone", device_name="计划手机")
+    p2 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="plan-tablet", device_name="计划表")
+    p3 = svc.login("赵远征", "Quiet-Fox-904!",
+                   device_id="plan-laptop", device_name="计划电脑")
+    staged = svc.plan_device_rollover(
+        "赵远征",
+        [["plan-phone"], ["plan-tablet", "plan-laptop"]],
+        minimum_available=2,
+        wind_down=timedelta(seconds=30),
+    )
+    print("计划", staged["id"], "模拟可行:", staged["simulation"]["feasible"])
+    for batch in staged["simulation"]["batches"]:
+        print("  批次", batch["batch_index"], "预计可用",
+              batch["projected_available_count"], batch["projected_available_after"])
+    expect("未批准先执行", svc.execute_rollover_batch, staged["id"], 0,
+           expected=PlanNotApprovedError)
+    svc.approve_rollover_batches(staged["id"], [0])
+    first_batch = svc.execute_rollover_batch(staged["id"], 0)
+    print("第 0 批执行结果:", [(r["device_id"], r["status"], r["generation"])
+                              for r in first_batch["results"]])
+    repeated = svc.execute_rollover_batch(staged["id"], 0)
+    print("重复提交第 0 批:", [(r["device_id"], r["status"])
+                              for r in repeated["results"]])
+    expect("第 1 批未批准", svc.execute_rollover_batch, staged["id"], 1,
+           expected=PlanNotApprovedError)
+    svc.approve_rollover_batches(staged["id"], [1])
+    second_batch = svc.execute_rollover_batch(staged["id"], 1)
+    new_tablet = next(
+        row for row in second_batch["results"]
+        if row["device_id"] == "plan-tablet"
+    )
+    print("第 1 批执行结果:", [(r["device_id"], r["status"], r["generation"])
+                              for r in second_batch["results"]])
+    expect("第一批旧续期仅按其旧代收尾规则拒绝", svc.refresh, p1.refresh_token,
+           expected=CredentialSupersededError)
+    expect("其他设备旧访问仍按自己的代次收尾", svc.check_access, p2.access_token)
+
+    section("9i. 紧急冻结优先阻断，并显式报告可用缺口")
+    gap = svc.freeze_device_compromised_report(
+        "赵远征", "plan-tablet",
+        managed_device_ids=["plan-phone", "plan-tablet", "plan-laptop"],
+        minimum_available=3,
+    )
+    print("冻结 plan-tablet 后缺口:", gap["shortfall"],
+          "不可用设备:", gap["availability_gap"])
+    expect("被怀疑设备的新代次也立即阻断", svc.check_access,
+           new_tablet["access_token"], expected=DeviceFrozenError)
 
     section("10. 导出设备活动记录（不含原始凭据）")
     export = svc.export_device_activity("赵远征")

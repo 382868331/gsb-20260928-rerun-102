@@ -11,10 +11,12 @@ from authcore import (
     AccountDisabledError,
     AuthService,
     CredentialSupersededError,
+    DeviceOfflineError,
     DeviceFrozenError,
     InvalidCredentialsError,
     InvalidTokenError,
     MalformedTokenError,
+    PlanNotApprovedError,
     TokenExpiredError,
     TokenReuseDetectedError,
     TokenRevokedError,
@@ -526,6 +528,194 @@ class DeviceRolloverTest(unittest.TestCase):
         events = restarted.export_device_activity("alice", "phone-1")
         self.assertTrue(all("presented_hash" in e for e in events if e["kind"] == "deny"))
         self.assertTrue(all(e.get("raw_credential") is None for e in events))
+
+
+class StagedRolloverPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "auth.db")
+        self.svc = AuthService(self.db, timedelta(hours=1), timedelta(hours=2))
+        self.svc.create_user("alice", "pw-alice")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def login(self, device_id):
+        return self.svc.login(
+            "alice", "pw-alice",
+            device_id=device_id, device_name=device_id,
+        )
+
+    def test_two_approved_batches_recheck_conditions_and_keep_generations_apart(self):
+        first = self.login("dev-1")
+        second = self.login("dev-2")
+        plan = self.svc.plan_device_rollover(
+            "alice", [["dev-1"], ["dev-2"]], minimum_available=1,
+            wind_down=timedelta(minutes=5),
+        )
+        self.assertTrue(plan["simulation"]["feasible"])
+        restarted = AuthService(self.db, timedelta(hours=1), timedelta(hours=2))
+        persisted_plan = restarted.get_rollover_plan(plan["id"])
+        self.assertEqual(persisted_plan["batches"], [["dev-1"], ["dev-2"]])
+        self.assertNotIn("access_token", repr(persisted_plan))
+        self.assertEqual(
+            [d["device_id"] for d in plan["simulation"]["batches"][0]["devices"]],
+            ["dev-1"],
+        )
+        with self.assertRaises(PlanNotApprovedError):
+            self.svc.execute_rollover_batch(plan["id"], 0)
+        self.svc.approve_rollover_batches(plan["id"], [0])
+        batch1 = self.svc.execute_rollover_batch(plan["id"], 0)
+        self.assertEqual(batch1["shortfall"], 0)
+        new_first = batch1["results"][0]
+        self.assertEqual(new_first["status"], "rolled_over")
+        self.assertEqual(new_first["generation"], 2)
+        # Repeating the same approved batch is idempotent and cannot increment
+        # the device generation a second time.
+        repeated = self.svc.execute_rollover_batch(plan["id"], 0)
+        self.assertEqual(repeated["results"][0]["status"], "skipped")
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(first.refresh_token)
+        detail = self.svc.check_access_detail(first.access_token)
+        self.assertEqual(detail["decision"], "wind_down")
+        self.assertEqual(detail["generation"], 1)
+        # The other device's old generation is untouched by the first batch.
+        self.assertEqual(self.svc.check_access(second.access_token), "alice")
+        self.assertEqual(self.svc.refresh(second.refresh_token).generation, 1)
+
+        with self.assertRaises(PlanNotApprovedError):
+            self.svc.execute_rollover_batch(plan["id"], 1)
+        self.svc.approve_rollover_batches(plan["id"], [1])
+        batch2 = self.svc.execute_rollover_batch(plan["id"], 1)
+        self.assertEqual(batch2["results"][0]["generation"], 2)
+        self.assertEqual(self.svc.get_rollover_plan(plan["id"])["status"],
+                         "executed")
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(second.refresh_token)
+        self.assertEqual(
+            self.svc.check_access_detail(new_first["access_token"])[
+                "generation"],
+            2,
+        )
+
+    def test_duplicate_device_in_plan_is_rejected(self):
+        self.login("dev-1")
+        self.login("dev-2")
+        with self.assertRaises(ValueError):
+            self.svc.plan_device_rollover(
+                "alice", [["dev-1"], ["dev-1", "dev-2"]], 1
+            )
+
+    def test_offline_device_fails_without_freezing_other_devices(self):
+        online = self.login("online")
+        offline = self.login("offline")
+        self.svc.logout(offline.access_token)
+        plan = self.svc.plan_device_rollover(
+            "alice", [["online", "offline"]], minimum_available=1
+        )
+        simulated = {d["device_id"]: d for d in plan["simulation"]["batches"][0]["devices"]}
+        self.assertFalse(simulated["offline"]["eligible"])
+        self.assertIn("offline", simulated["offline"]["reason"])
+        self.assertTrue(plan["simulation"]["feasible"])
+        self.svc.approve_rollover_batches(plan["id"], [0])
+        result = self.svc.execute_rollover_batch(plan["id"], 0)
+        statuses = {r["device_id"]: r["status"] for r in result["results"]}
+        self.assertEqual(statuses, {"online": "rolled_over", "offline": "failed"})
+        self.assertIn("DeviceOfflineError", result["results"][1]["reason"])
+        self.assertEqual(result["availability_gap"], ["offline"])
+        self.assertEqual(result["shortfall"], 0)
+        self.assertEqual(self.svc.check_access(online.access_token), "alice")
+        with self.assertRaises(DeviceOfflineError):
+            self.svc.rollover_device("alice", "offline")
+
+    def test_account_disabled_between_simulation_and_execution_blocks_current_batch(self):
+        first = self.login("dev-1")
+        second = self.login("dev-2")
+        plan = self.svc.plan_device_rollover(
+            "alice", [["dev-1", "dev-2"]], minimum_available=1
+        )
+        self.svc.approve_rollover_batches(plan["id"], [0])
+        self.svc.disable_user("alice")
+        result = self.svc.execute_rollover_batch(plan["id"], 0)
+        self.assertTrue(all(r["status"] == "failed" for r in result["results"]))
+        self.assertEqual(result["shortfall"], 1)
+        self.assertEqual(set(result["availability_gap"]), {"dev-1", "dev-2"})
+        self.svc.enable_user("alice")
+        # Disable permanently ended the old chains. Re-enabled devices must
+        # establish fresh chains before the still-approved plan can act.
+        relogged1 = self.login("dev-1")
+        relogged2 = self.login("dev-2")
+        result2 = self.svc.execute_rollover_batch(plan["id"], 0)
+        self.assertTrue(all(r["status"] == "rolled_over"
+                            for r in result2["results"]))
+        with self.assertRaises(TokenRevokedError):
+            self.svc.refresh(first.refresh_token)
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(relogged1.refresh_token)
+        with self.assertRaises(CredentialSupersededError):
+            self.svc.refresh(relogged2.refresh_token)
+        self.assertEqual(relogged1.generation, 2)
+        self.assertEqual(result2["results"][0]["generation"], 3)
+
+    def test_emergency_freeze_takes_precedence_and_reports_gap(self):
+        self.login("dev-1")
+        second = self.login("dev-2")
+        plan = self.svc.plan_device_rollover(
+            "alice", [["dev-1"], ["dev-2"]], minimum_available=2
+        )
+        self.svc.approve_rollover_batches(plan["id"], [0, 1])
+        first_result = self.svc.execute_rollover_batch(plan["id"], 0)
+        new_first_token = first_result["results"][0]["access_token"]
+        report = self.svc.freeze_device_compromised_report(
+            "alice", "dev-1",
+            managed_device_ids=["dev-1", "dev-2"],
+            minimum_available=2,
+        )
+        self.assertTrue(report["device_frozen"])
+        self.assertEqual(report["shortfall"], 1)
+        self.assertEqual(report["availability_gap"], ["dev-1"])
+        with self.assertRaises(DeviceFrozenError):
+            self.svc.check_access(new_first_token)
+        second_result = self.svc.execute_rollover_batch(plan["id"], 1)
+        self.assertEqual(second_result["results"][0]["status"], "rolled_over")
+        self.assertEqual(second_result["availability_gap"], ["dev-1"])
+        self.assertEqual(second_result["shortfall"], 1)
+        self.assertEqual(self.svc.check_access(second.access_token), "alice")
+
+    def test_each_old_generation_uses_its_own_wind_down_rule(self):
+        short_svc = AuthService(
+            str(Path(self.tmp.name) / "short.db"),
+            timedelta(hours=1), timedelta(hours=2),
+        )
+        short_svc.create_user("bob", "pw-bob")
+        gen1a = short_svc.login("bob", "pw-bob", device_id="dev-1")
+        gen1b = short_svc.login("bob", "pw-bob", device_id="dev-2")
+        plan = short_svc.plan_device_rollover(
+            "bob", [["dev-1"], ["dev-2"]], minimum_available=1,
+            wind_down=timedelta(milliseconds=80),
+        )
+        short_svc.approve_rollover_batches(plan["id"], [0, 1])
+        first = short_svc.execute_rollover_batch(plan["id"], 0)
+        new1 = first["results"][0]
+        threading.Event().wait(0.05)
+        second = short_svc.execute_rollover_batch(plan["id"], 1)
+        new2 = second["results"][0]
+        threading.Event().wait(0.06)
+        with self.assertRaises(CredentialSupersededError):
+            short_svc.check_access(gen1a.access_token)
+        # Device two retired later, so its own deadline is still open even
+        # though device one's earlier generation has already closed.
+        detail = short_svc.check_access_detail(gen1b.access_token)
+        self.assertEqual(detail["generation"], 1)
+        self.assertEqual(detail["decision"], "wind_down")
+        self.assertEqual(
+            short_svc.check_access_detail(new1["access_token"])["generation"],
+            2,
+        )
+        self.assertEqual(
+            short_svc.check_access_detail(new2["access_token"])["generation"],
+            2,
+        )
 
 
 if __name__ == "__main__":

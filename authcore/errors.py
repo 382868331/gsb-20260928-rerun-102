@@ -14,6 +14,14 @@ class AccountDisabledError(AuthError):
     """The account has been deactivated."""
 
 
+class PlanNotApprovedError(AuthError):
+    """A rollover batch was executed without explicit administrator approval."""
+
+
+class DeviceOfflineError(AuthError):
+    """Device has no active credential chain that can receive a rollover."""
+
+
 class MalformedTokenError(AuthError):
     """The credential string does not have the expected shape."""
 
